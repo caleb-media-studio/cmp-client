@@ -3,7 +3,8 @@
 // For writes, send the secret through stdin to security -i, never argv.
 #[cfg(target_os = "macos")]
 pub(super) mod mac_keychain {
-    use super::{Result, SERVICE};
+    use super::Result;
+    use super::super::SERVICE;
     use std::{io::Write, process::{Command, Stdio}};
     const HELPER: &str = "/usr/bin/security";
     const ACCOUNT: &str = "default";
