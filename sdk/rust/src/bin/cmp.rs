@@ -5,6 +5,12 @@ mod cmp_agents;
 mod cmp_mcp;
 #[path = "cmp/tui.rs"]
 mod cmp_tui;
+#[path = "cmp/offline.rs"]
+mod cmp_offline;
+#[path = "cmp/credentials.rs"]
+mod cmp_credentials;
+#[path = "cmp/stream.rs"]
+mod cmp_stream;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use cmp_context::Client;
 use fs2::FileExt;
@@ -37,6 +43,8 @@ struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<String>,
     branch: String,
+    #[serde(default)]
+    streaming: bool,
 }
 impl Config {
     fn new(backend: &str, endpoint: &str) -> Self {
@@ -46,6 +54,7 @@ impl Config {
             endpoint: endpoint.to_string(),
             repository: None,
             branch: "main".into(),
+            streaming: false,
         }
     }
 }
@@ -82,7 +91,7 @@ fn load_file(path: &Path) -> Result<Config> {
         return Err("Unsupported CMP config version".into());
     }
     config.endpoint = normalize_endpoint(&config.endpoint)?;
-    if config.backend != "cloud" && config.backend != "local" {
+    if !["cloud", "local", "offline"].contains(&config.backend.as_str()) {
         return Err("Invalid CMP backend".into());
     }
     Ok(config)
@@ -288,27 +297,41 @@ fn setup(args: &[String]) -> Result<()> {
         Some(s) => s,
         None if noninteractive => return Err("--backend required for noninteractive setup".into()),
         None => {
-            let choices = ["CMP Cloud · cloud.cmp.chat", "Self-hosted CMP server"];
-            if cmp_tui::choose("Which CMP backend would you like to use?", &choices, 0)? == 0 {
-                "cloud".into()
-            } else {
-                "local".into()
+            let choices = ["CMP Cloud · cloud.cmp.chat", "Self-hosted CMP server", "Local / Offline · device-only context"];
+            match cmp_tui::choose("Where should CMP context live?", &choices, 0)? {
+                0 => "cloud".into(),
+                1 => "local".into(),
+                _ => "offline".into(),
             }
         }
     };
-    if backend != "cloud" && backend != "local" {
+    if !["cloud", "local", "offline"].contains(&backend.as_str()) {
         return Err("Backend must be cloud or local".into());
     }
-    let fallback = if backend == "cloud" { CLOUD } else { LOCAL };
+    let fallback = if backend == "local" { LOCAL } else { CLOUD };
     let endpoint = match argument(args, "--endpoint") {
         Some(s) => s,
         None if noninteractive => fallback.into(),
-        None if backend == "cloud" => fallback.into(),
+        None if backend != "local" => fallback.into(),
         None => prompt("CMP server endpoint", fallback)?,
     };
     let endpoint = normalize_endpoint(&endpoint)?;
     let dest = scope_path(&scope)?;
     let mut cfg = Config::new(&backend, &endpoint);
+    if flag(args, "--streaming") && flag(args, "--no-streaming") {
+        return Err("Choose --streaming or --no-streaming, not both".into());
+    }
+    if backend == "offline" {
+        cfg.streaming = if flag(args, "--streaming") {
+            true
+        } else if flag(args, "--no-streaming") || noninteractive {
+            false
+        } else {
+            cmp_tui::confirm("Enable streaming? Context may leave this device.", false)?
+        };
+    } else if flag(args, "--streaming") {
+        return Err("Streaming is an option for the offline backend only".into());
+    }
     if scope == "project" {
         let repo = match argument(args, "--repo") {
             Some(s) => s,
@@ -341,17 +364,29 @@ fn setup(args: &[String]) -> Result<()> {
         } else if cmp_tui::confirm("Sign in to CMP Cloud now?", true)? {
             login(args)?;
         }
+    } else if backend == "offline" {
+        println!("Offline context storage: .cmp/state (no network while streaming disabled).");
+        println!("Streaming: {}", if cfg.streaming { "enabled (opt-in)" } else { "disabled" });
+        println!("Next: cmp init");
     } else {
-        println!("Local mode: use CMP_DEV_TOKEN to authenticate to the development server.");
+        println!("Self-hosted mode: use CMP_DEV_TOKEN to authenticate to the development server.");
         println!("Next: cmp doctor");
     }
     Ok(())
 }
-fn keyring_entry() -> Result<keyring::Entry> {
-    Ok(keyring::Entry::new(SERVICE, "default")?)
+fn context_request(cfg: &Config, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
+    if cfg.backend == "offline" {
+        let result = cmp_offline::request(cfg, method, path, body.clone())?;
+        if let Some(value) = &body {
+            cmp_stream::enqueue_and_try(cfg, method, path, value)?;
+        }
+        Ok(result)
+    } else {
+        Ok(client(cfg)?.request(method, path, body)?)
+    }
 }
 fn auth_token(cfg: &Config) -> Result<String> {
-    if cfg.backend == "local" {
+    if cfg.backend == "local" || (cfg.backend == "offline" && cfg.endpoint != CLOUD) {
         return env::var("CMP_DEV_TOKEN")
             .map_err(|_| "Local CMP server requires CMP_DEV_TOKEN".into());
     }
@@ -368,9 +403,8 @@ fn auth_token(cfg: &Config) -> Result<String> {
         .open(&lock_path)?;
     lock.lock_exclusive()?;
     let result = (|| {
-        let refresh = keyring_entry()?
-            .get_password()
-            .map_err(|_| "CMP Cloud is not signed in or OS keychain unavailable. Run cmp login")?;
+        let credential = cmp_credentials::load()?;
+        let refresh = credential.token.as_str();
         let response = ureq::post(&(cfg.endpoint.clone() + "/api/oauth/token"))
             .set("Content-Type", "application/x-www-form-urlencoded")
             .timeout(Duration::from_secs(12))
@@ -378,7 +412,7 @@ fn auth_token(cfg: &Config) -> Result<String> {
                 &url::form_urlencoded::Serializer::new(String::new())
                     .append_pair("grant_type", "refresh_token")
                     .append_pair("client_id", "cmp-cli")
-                    .append_pair("refresh_token", &refresh)
+                    .append_pair("refresh_token", refresh)
                     .finish(),
             )?;
         let response: Value = response.into_json()?;
@@ -388,7 +422,7 @@ fn auth_token(cfg: &Config) -> Result<String> {
         let next = response["refresh_token"]
             .as_str()
             .ok_or("CMP Cloud returned no refresh token")?;
-        keyring_entry()?.set_password(next)?;
+        cmp_credentials::rotate(&credential, next)?;
         Ok(access.to_owned())
     })();
     let _ = fs2::FileExt::unlock(&lock);
@@ -431,8 +465,8 @@ fn login(args: &[String]) -> Result<()> {
         }
         Err(error) => return Err(error),
     };
-    if cfg.backend != "cloud" || cfg.endpoint != CLOUD {
-        return Err("cmp login requires the CMP Cloud backend".into());
+    if !["cloud", "offline"].contains(&cfg.backend.as_str()) || cfg.endpoint != CLOUD {
+        return Err("cmp login requires CMP Cloud or offline mode with CMP Cloud as streaming destination".into());
     }
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
@@ -533,40 +567,79 @@ fn login(args: &[String]) -> Result<()> {
     let refresh = token["refresh_token"]
         .as_str()
         .ok_or("No refresh token returned by CMP Cloud")?;
-    keyring_entry()?.set_password(refresh)?;
-    println!("CMP Cloud account authorized. Credentials saved in your OS secure credential store.");
+    let chosen = match argument(args, "--credential-store") {
+        Some(value) => value,
+        None if !io::stdin().is_terminal() => "none".into(),
+        None if cmp_tui::confirm("Would you like to save in keychain?", true)? => "keychain".into(),
+        None if cmp_tui::confirm("Save credentials in an encrypted CMP file instead?", true)? => "encrypted".into(),
+        None => "none".into(),
+    };
+    let mode = match chosen.as_str() {
+        "keychain" => cmp_credentials::Storage::Keychain,
+        "encrypted" => cmp_credentials::Storage::EncryptedFile,
+        "none" => cmp_credentials::Storage::None,
+        _ => return Err("Credential store must be keychain, encrypted, or none".into()),
+    };
+    if let Err(error) = cmp_credentials::save(refresh, mode) {
+        if mode == cmp_credentials::Storage::Keychain && io::stdin().is_terminal()
+            && cmp_tui::confirm("Keychain unavailable. Save in an encrypted CMP file instead?", true)? {
+            cmp_credentials::save(refresh, cmp_credentials::Storage::EncryptedFile)?;
+        } else {
+            // Do not leave an untracked refresh token active after storage failure.
+            let _ = revoke_refresh(refresh);
+            return Err(error);
+        }
+    }
+    if mode == cmp_credentials::Storage::None {
+        let _ = revoke_refresh(refresh);
+        println!("CMP Cloud login completed; credentials were NOT saved. Run cmp login for a new session.");
+    } else {
+        println!("CMP Cloud authorization completed. Credential storage selection saved.");
+    }
+    Ok(())
+}
+fn revoke_refresh(refresh: &str) -> Result<()> {
+    let form = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("client_id", "cmp-cli")
+        .append_pair("token", refresh)
+        .finish();
+    ureq::post(&format!("{CLOUD}/api/oauth/revoke"))
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .timeout(Duration::from_secs(7))
+        .send_string(&form)?;
     Ok(())
 }
 fn logout() -> Result<()> {
-    let entry = keyring_entry()?;
-    if let Ok(value) = entry.get_password() {
-        let form = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("client_id", "cmp-cli")
-            .append_pair("token", &value)
-            .finish();
-        ureq::post(&format!("{CLOUD}/api/oauth/revoke"))
-            .set("Content-Type", "application/x-www-form-urlencoded")
-            .timeout(Duration::from_secs(7))
-            .send_string(&form)?;
-        entry.delete_credential()?;
+    if let Ok(credential) = cmp_credentials::load() {
+        // If Cloud is unreachable, do not silently claim the refresh token was revoked.
+        revoke_refresh(&credential.token)?;
     }
-    println!("CMP Cloud credentials revoked.");
+    cmp_credentials::clear()?;
+    println!("CMP Cloud credentials cleared and remote token revoked when available.");
     Ok(())
 }
+
 fn doctor(args: &[String]) -> Result<()> {
     let (cfg, path) = load_config()?;
     println!("Configuration: {}", path.display());
     println!("Backend: {} | Server: {}", cfg.backend, cfg.endpoint);
-    if flag(args, "--offline") {
-        println!("Offline configuration valid.");
+    if flag(args, "--offline") || cfg.backend == "offline" {
+        println!("Local context store: available (no remote requests).");
+        if cfg.backend == "offline" {
+            println!("Streaming: {}", if cfg.streaming { "enabled" } else { "disabled" });
+            println!("Pending stream operations: {}", cmp_stream::pending()?);
+        }
         return Ok(());
     }
-    let caps: Value = ureq::get(&(cfg.endpoint.clone() + "/v1/capabilities"))
-        .timeout(Duration::from_secs(8))
-        .call()?
-        .into_json()?;
+    let caps: Value = if cfg.backend == "local" {
+        context_request(&cfg, "GET", "/v1/capabilities", None)?
+    } else {
+        ureq::get(&(cfg.endpoint.clone() + "/v1/capabilities"))
+            .timeout(Duration::from_secs(8))
+            .call()?.into_json()?
+    };
     println!("Protocol capabilities: {}", caps["capabilities"]);
-    match client(&cfg).and_then(|c| c.list_repositories()) {
+    match context_request(&cfg, "GET", "/v1/repos", None) {
         Ok(_) => println!("Authenticated repository API: connected"),
         Err(e) => println!("Authenticated repository API: unavailable ({e})"),
     }
@@ -575,7 +648,7 @@ fn doctor(args: &[String]) -> Result<()> {
 fn status() -> Result<()> {
     let (cfg, file) = load_config()?;
     println!(
-        "Scope: {}\nBackend: {}\nEndpoint: {}\nRepository: {}\nBranch: {}",
+        "Scope: {}\nBackend: {}\nEndpoint: {}\nRepository: {}\nBranch: {}\nStreaming: {}",
         if env::var_os("CMP_CONFIG").is_some() {
             "explicit"
         } else if global_file().is_ok_and(|global| global == file) {
@@ -586,39 +659,46 @@ fn status() -> Result<()> {
         cfg.backend,
         cfg.endpoint,
         cfg.repository.as_deref().unwrap_or("not selected"),
-        cfg.branch
+        cfg.branch,
+        if cfg.streaming { "enabled" } else { "disabled" }
     );
     println!("Config: {}", file.display());
-    if cfg.backend == "cloud" {
-        let logged = keyring_entry()
-            .and_then(|e| e.get_password().map_err(|e| e.into()))
-            .is_ok();
+    if cfg.backend == "offline" {
+        println!("Storage: {}", file.parent().unwrap().join("state").display());
+        println!("Pending stream operations: {}", cmp_stream::pending()?);
+    }
+    if cfg.backend == "cloud" || (cfg.backend == "offline" && cfg.streaming && cfg.endpoint == CLOUD) {
+        let status = cmp_credentials::available_status()?;
         println!(
             "Authentication: {}",
-            if logged {
-                "stored in OS credential vault"
-            } else {
-                "not authenticated"
-            }
+            status
         );
-    } else {
-        println!(
-            "Authentication: {}",
-            if env::var("CMP_DEV_TOKEN").is_ok() {
-                "local token available"
-            } else {
-                "local token required"
-            }
-        )
+    } else if cfg.backend == "local" {
+        println!("Authentication: {}", if env::var("CMP_DEV_TOKEN").is_ok() { "local server token available" } else { "local server token required" });
     }
     Ok(())
 }
 fn init(args: &[String]) -> Result<()> {
     let (mut cfg, _from) = load_config()?;
     let noninteractive = flag(args, "--no-interactive");
+    // Preserve legacy self-hosted setup: `init --offline` historically meant
+    // skip the network check, not silently change an existing local-server config.
+    if flag(args, "--offline") && cfg.backend != "local" {
+        cfg.backend = "offline".into();
+        cfg.streaming = false;
+    }
+    if flag(args, "--streaming") && flag(args, "--no-streaming") {
+        return Err("Choose --streaming or --no-streaming, not both".into());
+    }
+    if flag(args, "--streaming") || flag(args, "--no-streaming") {
+        if cfg.backend != "offline" { return Err("Streaming requires local / offline mode".into()); }
+        cfg.streaming = flag(args, "--streaming");
+    } else if cfg.backend == "offline" && !noninteractive {
+        cfg.streaming = cmp_tui::confirm("Stream future local context updates to the configured server?", cfg.streaming)?;
+    }
     // Inspect the current project before any remote repo creation.
     let path = project_file()?;
-    let cli = if flag(args, "--offline") {
+    let cli = if cfg.backend == "offline" || flag(args, "--offline") {
         None
     } else {
         Some(client(&cfg)?)
@@ -630,7 +710,11 @@ fn init(args: &[String]) -> Result<()> {
         }
         None => {
             require_tty()?;
-            let mut repositories = if let Some(c) = &cli {
+            let mut repositories = if cfg.backend == "offline" {
+                let values = cmp_offline::request(&cfg, "GET", "/v1/repos", None)?;
+                values["repositories"].as_array().into_iter().flatten()
+                    .filter_map(Value::as_str).map(ToOwned::to_owned).collect::<Vec<_>>()
+            } else if let Some(c) = &cli {
                 let values = c.list_repositories()?;
                 values["repositories"]
                     .as_array()
@@ -678,6 +762,7 @@ fn init(args: &[String]) -> Result<()> {
         // Project setup can leave a repository unbound; init can fill it in.
         // If the binding already matches, leave it untouched.
         current.repository.as_deref() == Some(repo.as_str())
+            && current.streaming == cfg.streaming
     } else {
         false
     };
@@ -728,6 +813,14 @@ fn init(args: &[String]) -> Result<()> {
     cfg.repository = Some(repo.clone());
     if !preserve_existing {
         save_config(&path, &cfg)?;
+    }
+    if cfg.backend == "offline" {
+        let repositories = cmp_offline::request(&cfg, "GET", "/v1/repos", None)?;
+        let found = repositories["repositories"].as_array()
+            .is_some_and(|list| list.iter().any(|item| item.as_str() == Some(&repo)));
+        if !found {
+            context_request(&cfg, "POST", "/v1/repos", Some(json!({"id":repo,"visibility":"private"})))?;
+        }
     }
     let docs = find_docs(&env::current_dir()?)?;
     cmp_tui::success(format!(
@@ -831,6 +924,15 @@ fn command(args: Vec<String>) -> Result<()> {
         }
         "setup" => setup(&args[1..]),
         "login" => login(&args[1..]),
+        "stream" if args.get(1).is_some_and(|x| x == "push") => {
+            let (cfg, _) = load_config()?;
+            println!("Flushed {} pending CMP stream operations.", cmp_stream::push(&cfg)?);
+            Ok(())
+        }
+        "stream" if args.get(1).is_some_and(|x| x == "status") => {
+            println!("Pending CMP stream operations: {}", cmp_stream::pending()?);
+            Ok(())
+        },
         "logout" => logout(),
         "auth" if args.get(1).is_some_and(|x| x == "status") => status(),
         "status" => status(),
@@ -856,7 +958,7 @@ fn command(args: Vec<String>) -> Result<()> {
             let (cfg, _) = load_config()?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&client(&cfg)?.list_repositories()?)?
+                serde_json::to_string_pretty(&context_request(&cfg, "GET", "/v1/repos", None)?)?
             );
             Ok(())
         }
@@ -872,9 +974,8 @@ fn command(args: Vec<String>) -> Result<()> {
             let (cfg, _) = load_config()?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&client(&cfg)?.request(
-                    "POST",
-                    "/v1/repos",
+                serde_json::to_string_pretty(&context_request(
+                    &cfg, "POST", "/v1/repos",
                     Some(json!({"id":repo,"visibility":visibility}))
                 )?)?
             );
@@ -900,7 +1001,7 @@ fn command(args: Vec<String>) -> Result<()> {
             );
             println!(
                 "{}",
-                serde_json::to_string_pretty(&client(&cfg)?.request("GET", &path, None)?)?
+                serde_json::to_string_pretty(&context_request(&cfg, "GET", &path, None)?)?
             );
             Ok(())
         }
@@ -918,9 +1019,8 @@ fn command(args: Vec<String>) -> Result<()> {
             let from = args.get(3).map(String::as_str).unwrap_or(&cfg.branch);
             println!(
                 "{}",
-                serde_json::to_string_pretty(&client(&cfg)?.request(
-                    "POST",
-                    &path,
+                serde_json::to_string_pretty(&context_request(
+                    &cfg, "POST", &path,
                     Some(json!({"name":name,"from":from}))
                 )?)?
             );
@@ -945,7 +1045,6 @@ fn command(args: Vec<String>) -> Result<()> {
             // Never replace an explicit CAS precondition with a fresh head:
             // that would silently accept stale edits from another writer.
             let explicit = explicit_commit_head(&payload)?.map(str::to_owned);
-            let sdk = client(&cfg)?;
             let expected = if let Some(head) = explicit {
                 head
             } else {
@@ -954,7 +1053,7 @@ fn command(args: Vec<String>) -> Result<()> {
                     url::form_urlencoded::byte_serialize(repo.as_bytes()).collect::<String>(),
                     url::form_urlencoded::byte_serialize(branch.as_bytes()).collect::<String>()
                 );
-                let current = sdk.request("GET", &path, None)?;
+                let current = context_request(&cfg, "GET", &path, None)?;
                 current["head"]
                     .as_str()
                     .ok_or("Branch head not returned")?
@@ -969,7 +1068,7 @@ fn command(args: Vec<String>) -> Result<()> {
             );
             println!(
                 "{}",
-                serde_json::to_string_pretty(&sdk.request("POST", &commit_path, Some(payload))?)?
+                serde_json::to_string_pretty(&context_request(&cfg, "POST", &commit_path, Some(payload))?)?
             );
             Ok(())
         }
@@ -989,7 +1088,7 @@ fn command(args: Vec<String>) -> Result<()> {
             );
             println!(
                 "{}",
-                serde_json::to_string_pretty(&client(&cfg)?.request("GET", &path, None)?)?
+                serde_json::to_string_pretty(&context_request(&cfg, "GET", &path, None)?)?
             );
             Ok(())
         }
@@ -1004,7 +1103,10 @@ fn command(args: Vec<String>) -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &client(&cfg)?.merge(&repo, source, target, "cmp-cli")?
+                    &context_request(&cfg, "POST", &format!(
+                        "/v1/repos/{}/merge",
+                        url::form_urlencoded::byte_serialize(repo.as_bytes()).collect::<String>()
+                    ), Some(json!({"source":source,"target":target,"authorId":"cmp-cli"})))?
                 )?
             );
             Ok(())
@@ -1018,9 +1120,12 @@ fn help() -> Result<()> {
     println!(
         r#"CMP context CLI (Rust)
   cmp setup     Configure global ~/.cmp/config.toml or project .cmp/config.toml
-  cmp login     Authenticate with CMP Cloud in a browser via OAuth PKCE
+                --backend offline [--streaming | --no-streaming]
+  cmp login     Authenticate with CMP Cloud via OAuth PKCE
+                --credential-store keychain|encrypted|none
   cmp logout    Revoke CMP CLI credentials
-  cmp init      Bind current project to a context repository
+  cmp init      Bind current project; --offline [--streaming] opts into local storage
+  cmp stream push | status   Retry queued local-to-remote context updates
   cmp status    Show effective config and auth state
   cmp doctor    Check backend capabilities and authentication
   cmp repo list | repo create owner/name [--visibility private|public]
@@ -1031,8 +1136,10 @@ fn help() -> Result<()> {
   cmp agent list | install claude|codex|opencode | remove <host>
   cmp --version
 
-Project config overrides global. Cloud credentials live in the OS credential vault,
-not in either .cmp config. The existing cmp-context and cmp-companion remain available.
+Project config overrides global. Offline context lives in .cmp/state and never
+uses the network unless streaming is explicitly enabled. CMP Cloud credentials
+can use an OS keychain or a passphrase-encrypted file under ~/.cmp.
+The existing cmp-context and cmp-companion remain available.
 Future: agent installers, full documentation import, Cloud managed sessions.
 "#
     );
