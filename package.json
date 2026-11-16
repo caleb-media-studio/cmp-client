@@ -1,0 +1,20 @@
+{
+  "name": "cmp-client",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "pnpm -r run build",
+    "test": "pnpm --filter @cmp-chat/protocol run test && node scripts/verify-event-cursors.mjs && node scripts/verify-sdk-matrix.mjs && node scripts/verify-cloud-capabilities.mjs",
+    "typecheck": "pnpm run build",
+    "verify:local": "pnpm run build && node scripts/verify-local.mjs",
+    "verify:languages": "pnpm run build && node scripts/verify-language-sdks.mjs",
+    "protocol:sync": "node scripts/sync-protocol.mjs --write",
+    "protocol:check": "node scripts/check-protocol-sync.mjs",
+    "verify:cloud-client": "pnpm run build && node scripts/verify-cloud-capabilities.mjs"
+  },
+  "packageManager": "pnpm@10.34.9"
+}

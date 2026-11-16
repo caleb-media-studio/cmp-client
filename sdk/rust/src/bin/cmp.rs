@@ -1,0 +1,1123 @@
+//! CMP's native developer CLI. The protocol library is in cmp_context.
+#[path = "cmp/agents.rs"]
+mod cmp_agents;
+#[path = "cmp/mcp.rs"]
+mod cmp_mcp;
+#[path = "cmp/tui.rs"]
+mod cmp_tui;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use cmp_context::Client;
+use fs2::FileExt;
+use rand::{rngs::OsRng, RngCore};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    env,
+    error::Error,
+    fs::{self, OpenOptions},
+    io::{self, IsTerminal, Read, Write},
+    net::TcpListener,
+    path::{Path, PathBuf},
+    process::Command,
+    thread,
+    time::{Duration, Instant},
+};
+type Result<T> = std::result::Result<T, Box<dyn Error>>;
+const CLOUD: &str = "https://cloud.cmp.chat";
+const LOCAL: &str = "http://127.0.0.1:8787";
+const SERVICE: &str = "cmp.cloud.cli";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    version: u8,
+    backend: String,
+    endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<String>,
+    branch: String,
+}
+impl Config {
+    fn new(backend: &str, endpoint: &str) -> Self {
+        Self {
+            version: 1,
+            backend: backend.to_string(),
+            endpoint: endpoint.to_string(),
+            repository: None,
+            branch: "main".into(),
+        }
+    }
+}
+fn home() -> Result<PathBuf> {
+    let root = env::var_os("CMP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(PathBuf::from))
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+        .ok_or("Unable to determine home directory")?;
+    if !root.is_absolute() {
+        return Err("CMP home must be an absolute path".into());
+    }
+    Ok(root)
+}
+fn global_file() -> Result<PathBuf> {
+    Ok(home()?.join(".cmp/config.toml"))
+}
+fn project_file() -> Result<PathBuf> {
+    Ok(env::current_dir()?.join(".cmp/config.toml"))
+}
+fn normalize_endpoint(value: &str) -> Result<String> {
+    validate_endpoint(value)?;
+    // URL parsing normalizes host casing, default ports, and trailing root '/'.
+    // OAuth must compare canonical origins, not textual variants of the same URL.
+    Ok(url::Url::parse(value)?
+        .as_str()
+        .trim_end_matches('/')
+        .to_owned())
+}
+fn load_file(path: &Path) -> Result<Config> {
+    let file = fs::read_to_string(path)?;
+    let mut config: Config = toml::from_str(&file)?;
+    if config.version != 1 {
+        return Err("Unsupported CMP config version".into());
+    }
+    config.endpoint = normalize_endpoint(&config.endpoint)?;
+    if config.backend != "cloud" && config.backend != "local" {
+        return Err("Invalid CMP backend".into());
+    }
+    Ok(config)
+}
+fn nearest_project_file(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .map(|dir| dir.join(".cmp/config.toml"))
+        .find(|path| path.is_file())
+}
+fn load_config() -> Result<(Config, PathBuf)> {
+    // Explicit config selects the source, but does not bypass environment overrides.
+    let selected = env::var_os("CMP_CONFIG").map(PathBuf::from);
+    let project = nearest_project_file(&env::current_dir()?);
+    let source = if let Some(path) = selected.or(project) {
+        path
+    } else {
+        // A selected local configuration must work without HOME, such as in
+        // a minimal container. Discover ~/.cmp only as a final fallback.
+        let global = global_file()?;
+        if !global.is_file() {
+            return Err("CMP is not configured. Run cmp setup".into());
+        }
+        global
+    };
+    let mut cfg = load_file(&source)?;
+    if let Ok(endpoint) = env::var("CMP_ENDPOINT") {
+        cfg.endpoint = normalize_endpoint(&endpoint)?;
+    }
+    if let Ok(repo) = env::var("CMP_REPOSITORY") {
+        validate_repo(&repo)?;
+        cfg.repository = Some(repo);
+    }
+    Ok((cfg, source))
+}
+fn validate_repo(id: &str) -> Result<()> {
+    let parts: Vec<_> = id.split('/').collect();
+    if parts.len() != 2
+        || parts.iter().any(|p| {
+            p.is_empty()
+                || p.len() > 100
+                || !p
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        })
+    {
+        return Err("Repository must have the form owner/name".into());
+    }
+    Ok(())
+}
+fn validate_endpoint(value: &str) -> Result<()> {
+    let url = url::Url::parse(value)?;
+    if url.username() != ""
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.query().is_some()
+        || url.path() != "/"
+    {
+        return Err("CMP endpoint cannot contain credentials, query or a path".into());
+    }
+    if url.scheme() != "https"
+        && !(url.scheme() == "http"
+            && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")))
+    {
+        return Err("Remote CMP endpoints must use HTTPS; localhost may use HTTP".into());
+    }
+    Ok(())
+}
+#[cfg(unix)]
+fn private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+#[cfg(not(unix))]
+fn private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    Ok(())
+}
+fn save_config(file: &Path, config: &Config) -> Result<()> {
+    let parent = file
+        .parent()
+        .ok_or("Invalid CMP configuration destination")?;
+    private_dir(parent)?;
+    if fs::symlink_metadata(file).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("Refusing to overwrite symbolic link in CMP configuration".into());
+    }
+    let tmp = parent.join(format!(".config-{}.tmp", random_short()));
+    #[cfg(unix)]
+    let mut handle = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?
+    };
+    #[cfg(not(unix))]
+    let mut handle = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    handle.write_all(toml::to_string_pretty(config)?.as_bytes())?;
+    handle.sync_all()?;
+    drop(handle);
+    if let Err(err) = fs::rename(&tmp, file) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    Ok(())
+}
+fn write_secure_file(file: &Path, body: &str, replace: bool) -> Result<()> {
+    let parent = file.parent().ok_or("Invalid CMP config path")?;
+    // Host configuration may be at the project root (opencode.json).
+    // Do not chmod a pre-existing project or agent-owned directory to 0700.
+    // CMP-owned .cmp directories are restricted separately by save_config().
+    fs::create_dir_all(parent)?;
+    if fs::symlink_metadata(file).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("Refusing to modify symlinked config".into());
+    }
+    if file.exists() && !replace {
+        return Err("Target file already exists; refusing to overwrite".into());
+    }
+    let tmp = parent.join(format!(".cmp-edit-{}.tmp", random_short()));
+    #[cfg(unix)]
+    let mut handle = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?
+    };
+    #[cfg(not(unix))]
+    let mut handle = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    handle.write_all(body.as_bytes())?;
+    handle.sync_all()?;
+    drop(handle);
+    if let Err(err) = fs::rename(&tmp, file) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    Ok(())
+}
+fn explicit_commit_head(payload: &Value) -> Result<Option<&str>> {
+    let Some(value) = payload.get("expectedHead") else {
+        return Ok(None);
+    };
+    let head = value
+        .as_str()
+        .ok_or("expectedHead must be a commit hash string")?;
+    if head.len() != 64 || !head.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err("expectedHead must contain exactly 64 hexadecimal characters".into());
+    }
+    Ok(Some(head))
+}
+fn random_short() -> String {
+    let mut raw = [0u8; 8];
+    OsRng.fill_bytes(&mut raw);
+    URL_SAFE_NO_PAD.encode(raw)
+}
+fn prompt(question: &str, default: &str) -> Result<String> {
+    cmp_tui::input(question, default)
+}
+
+fn require_tty() -> Result<()> {
+    if !io::stdin().is_terminal() {
+        return Err(
+            "Noninteractive session: supply --scope, --backend and relevant options".into(),
+        );
+    }
+    Ok(())
+}
+fn argument(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
+fn flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|x| x == name)
+}
+fn scope_path(scope: &str) -> Result<PathBuf> {
+    match scope {
+        "global" => global_file(),
+        "project" => project_file(),
+        _ => Err("Scope must be global or project".into()),
+    }
+}
+fn setup(args: &[String]) -> Result<()> {
+    let noninteractive = flag(args, "--no-interactive");
+    if !noninteractive {
+        require_tty()?;
+    }
+    let scope = match argument(args, "--scope") {
+        Some(s) => s,
+        None if noninteractive => return Err("--scope required for noninteractive setup".into()),
+        None => {
+            let choices = ["Global (~/.cmp) · all projects", "This project (./.cmp)"];
+            if cmp_tui::choose("Where should CMP store its configuration?", &choices, 0)? == 0 {
+                "global".into()
+            } else {
+                "project".into()
+            }
+        }
+    };
+    let backend = match argument(args, "--backend") {
+        Some(s) => s,
+        None if noninteractive => return Err("--backend required for noninteractive setup".into()),
+        None => {
+            let choices = ["CMP Cloud · cloud.cmp.chat", "Self-hosted CMP server"];
+            if cmp_tui::choose("Which CMP backend would you like to use?", &choices, 0)? == 0 {
+                "cloud".into()
+            } else {
+                "local".into()
+            }
+        }
+    };
+    if backend != "cloud" && backend != "local" {
+        return Err("Backend must be cloud or local".into());
+    }
+    let fallback = if backend == "cloud" { CLOUD } else { LOCAL };
+    let endpoint = match argument(args, "--endpoint") {
+        Some(s) => s,
+        None if noninteractive => fallback.into(),
+        None if backend == "cloud" => fallback.into(),
+        None => prompt("CMP server endpoint", fallback)?,
+    };
+    let endpoint = normalize_endpoint(&endpoint)?;
+    let dest = scope_path(&scope)?;
+    let mut cfg = Config::new(&backend, &endpoint);
+    if scope == "project" {
+        let repo = match argument(args, "--repo") {
+            Some(s) => s,
+            None if noninteractive => String::new(),
+            None => prompt("Context repository (owner/name, or leave empty)", "")?,
+        };
+        if !repo.is_empty() {
+            validate_repo(&repo)?;
+            cfg.repository = Some(repo);
+        }
+    }
+    if dest.exists() && !flag(args, "--force") {
+        if noninteractive {
+            return Err("CMP config exists; use --force to replace explicitly".into());
+        }
+        if !cmp_tui::confirm("Replace existing CMP configuration?", false)? {
+            return Err("Setup cancelled; existing config preserved".into());
+        }
+    }
+    save_config(&dest, &cfg)?;
+    cmp_tui::success(format!(
+        "Configured CMP {}: {} ({})",
+        scope,
+        endpoint,
+        dest.display()
+    ));
+    if backend == "cloud" {
+        if noninteractive || flag(args, "--skip-login") {
+            println!("Next: cmp login");
+        } else if cmp_tui::confirm("Sign in to CMP Cloud now?", true)? {
+            login(args)?;
+        }
+    } else {
+        println!("Local mode: use CMP_DEV_TOKEN to authenticate to the development server.");
+        println!("Next: cmp doctor");
+    }
+    Ok(())
+}
+fn keyring_entry() -> Result<keyring::Entry> {
+    Ok(keyring::Entry::new(SERVICE, "default")?)
+}
+fn auth_token(cfg: &Config) -> Result<String> {
+    if cfg.backend == "local" {
+        return env::var("CMP_DEV_TOKEN")
+            .map_err(|_| "Local CMP server requires CMP_DEV_TOKEN".into());
+    }
+    if cfg.endpoint != CLOUD {
+        return Err("Delegated CMP Cloud OAuth currently supports only cloud.cmp.chat".into());
+    }
+    let root = home()?.join(".cmp");
+    private_dir(&root)?;
+    let lock_path = root.join(".refresh.lock");
+    let lock = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    lock.lock_exclusive()?;
+    let result = (|| {
+        let refresh = keyring_entry()?
+            .get_password()
+            .map_err(|_| "CMP Cloud is not signed in or OS keychain unavailable. Run cmp login")?;
+        let response = ureq::post(&(cfg.endpoint.clone() + "/api/oauth/token"))
+            .set("Content-Type", "application/x-www-form-urlencoded")
+            .timeout(Duration::from_secs(12))
+            .send_string(
+                &url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("grant_type", "refresh_token")
+                    .append_pair("client_id", "cmp-cli")
+                    .append_pair("refresh_token", &refresh)
+                    .finish(),
+            )?;
+        let response: Value = response.into_json()?;
+        let access = response["access_token"]
+            .as_str()
+            .ok_or("CMP Cloud returned no access token")?;
+        let next = response["refresh_token"]
+            .as_str()
+            .ok_or("CMP Cloud returned no refresh token")?;
+        keyring_entry()?.set_password(next)?;
+        Ok(access.to_owned())
+    })();
+    let _ = fs2::FileExt::unlock(&lock);
+    result
+}
+fn client(cfg: &Config) -> Result<Client> {
+    Ok(Client::new(&cfg.endpoint, auth_token(cfg)?))
+}
+fn open_url(url: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        // Execute Explorer directly: cmd /C start reparses ampersands in
+        // OAuth query strings as shell metacharacters on Windows.
+        let mut c = Command::new("explorer.exe");
+        c.arg(url);
+        c
+    };
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.spawn().is_ok()
+}
+fn login(args: &[String]) -> Result<()> {
+    // Use the same effective configuration as repo commands, including
+    // CMP_CONFIG and environment overrides. A missing config is allowed so
+    // first-time users can sign in before running setup.
+    let cfg = match load_config() {
+        Ok((config, _)) => config,
+        Err(error) if error.to_string() == "CMP is not configured. Run cmp setup" => {
+            Config::new("cloud", CLOUD)
+        }
+        Err(error) => return Err(error),
+    };
+    if cfg.backend != "cloud" || cfg.endpoint != CLOUD {
+        return Err("cmp login requires the CMP Cloud backend".into());
+    }
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let redirect = format!(
+        "http://127.0.0.1:{}/callback",
+        listener.local_addr()?.port()
+    );
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let verifier = URL_SAFE_NO_PAD.encode(bytes);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    OsRng.fill_bytes(&mut bytes);
+    let state = URL_SAFE_NO_PAD.encode(bytes);
+    let url = url::Url::parse_with_params(
+        &(cfg.endpoint.clone() + "/oauth/authorize"),
+        &[
+            ("client_id", "cmp-cli"),
+            ("response_type", "code"),
+            ("code_challenge_method", "S256"),
+            ("code_challenge", &challenge),
+            ("state", &state),
+            ("scope", "repo:read repo:write offline_access"),
+            ("redirect_uri", &redirect),
+        ],
+    )?;
+    println!("Authorize CMP CLI in your browser. Never paste tokens into the terminal.");
+    if flag(args, "--no-browser") || !open_url(url.as_str()) {
+        println!("Open this authorization URL on the same device:\n{url}");
+    }
+    let start = Instant::now();
+    let code = loop {
+        if start.elapsed() > Duration::from_secs(180) {
+            return Err("CMP login timed out".into());
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream.set_read_timeout(Some(Duration::from_secs(4)))?;
+                let mut buffer = [0u8; 4096];
+                let n = stream.read(&mut buffer)?;
+                let request = String::from_utf8_lossy(&buffer[..n]);
+                let target = request
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("");
+                let parsed = url::Url::parse(&format!("http://127.0.0.1{target}"));
+                let params = parsed.as_ref().ok().filter(|u| u.path() == "/callback");
+                let valid_state = params
+                    .and_then(|u| {
+                        u.query_pairs()
+                            .find(|(k, _)| k == "state")
+                            .map(|(_, v)| v.to_string())
+                    })
+                    .is_some_and(|given| given == state);
+                let authorized = if valid_state {
+                    params.and_then(|u| {
+                        u.query_pairs()
+                            .find(|(k, _)| k == "code")
+                            .map(|(_, v)| v.to_string())
+                    })
+                } else {
+                    None
+                };
+                let body = if authorized.is_some() {
+                    "CMP authorization received. You may return to your terminal."
+                } else {
+                    "CMP authorization was rejected or cancelled. Return to your terminal."
+                };
+                let response=format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
+                let _ = stream.write_all(response.as_bytes());
+                if let Some(code) = authorized {
+                    break code;
+                }
+                if params.is_some() {
+                    return Err("CMP authorization denied or state validation failed".into());
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(120))
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let form = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "authorization_code")
+        .append_pair("client_id", "cmp-cli")
+        .append_pair("code", &code)
+        .append_pair("code_verifier", &verifier)
+        .append_pair("redirect_uri", &redirect)
+        .finish();
+    let token: Value = ureq::post(&(cfg.endpoint + "/api/oauth/token"))
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .timeout(Duration::from_secs(15))
+        .send_string(&form)?
+        .into_json()?;
+    let refresh = token["refresh_token"]
+        .as_str()
+        .ok_or("No refresh token returned by CMP Cloud")?;
+    keyring_entry()?.set_password(refresh)?;
+    println!("CMP Cloud account authorized. Credentials saved in your OS secure credential store.");
+    Ok(())
+}
+fn logout() -> Result<()> {
+    let entry = keyring_entry()?;
+    if let Ok(value) = entry.get_password() {
+        let form = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("client_id", "cmp-cli")
+            .append_pair("token", &value)
+            .finish();
+        ureq::post(&format!("{CLOUD}/api/oauth/revoke"))
+            .set("Content-Type", "application/x-www-form-urlencoded")
+            .timeout(Duration::from_secs(7))
+            .send_string(&form)?;
+        entry.delete_credential()?;
+    }
+    println!("CMP Cloud credentials revoked.");
+    Ok(())
+}
+fn doctor(args: &[String]) -> Result<()> {
+    let (cfg, path) = load_config()?;
+    println!("Configuration: {}", path.display());
+    println!("Backend: {} | Server: {}", cfg.backend, cfg.endpoint);
+    if flag(args, "--offline") {
+        println!("Offline configuration valid.");
+        return Ok(());
+    }
+    let caps: Value = ureq::get(&(cfg.endpoint.clone() + "/v1/capabilities"))
+        .timeout(Duration::from_secs(8))
+        .call()?
+        .into_json()?;
+    println!("Protocol capabilities: {}", caps["capabilities"]);
+    match client(&cfg).and_then(|c| c.list_repositories()) {
+        Ok(_) => println!("Authenticated repository API: connected"),
+        Err(e) => println!("Authenticated repository API: unavailable ({e})"),
+    }
+    Ok(())
+}
+fn status() -> Result<()> {
+    let (cfg, file) = load_config()?;
+    println!(
+        "Scope: {}\nBackend: {}\nEndpoint: {}\nRepository: {}\nBranch: {}",
+        if env::var_os("CMP_CONFIG").is_some() {
+            "explicit"
+        } else if global_file().is_ok_and(|global| global == file) {
+            "global"
+        } else {
+            "project"
+        },
+        cfg.backend,
+        cfg.endpoint,
+        cfg.repository.as_deref().unwrap_or("not selected"),
+        cfg.branch
+    );
+    println!("Config: {}", file.display());
+    if cfg.backend == "cloud" {
+        let logged = keyring_entry()
+            .and_then(|e| e.get_password().map_err(|e| e.into()))
+            .is_ok();
+        println!(
+            "Authentication: {}",
+            if logged {
+                "stored in OS credential vault"
+            } else {
+                "not authenticated"
+            }
+        );
+    } else {
+        println!(
+            "Authentication: {}",
+            if env::var("CMP_DEV_TOKEN").is_ok() {
+                "local token available"
+            } else {
+                "local token required"
+            }
+        )
+    }
+    Ok(())
+}
+fn init(args: &[String]) -> Result<()> {
+    let (mut cfg, _from) = load_config()?;
+    let noninteractive = flag(args, "--no-interactive");
+    // Inspect the current project before any remote repo creation.
+    let path = project_file()?;
+    let cli = if flag(args, "--offline") {
+        None
+    } else {
+        Some(client(&cfg)?)
+    };
+    let repo = match argument(args, "--repo").or(cfg.repository.clone()) {
+        Some(s) => s,
+        None if noninteractive => {
+            return Err("cmp init --repo owner/name is required without a TTY".into());
+        }
+        None => {
+            require_tty()?;
+            let mut repositories = if let Some(c) = &cli {
+                let values = c.list_repositories()?;
+                values["repositories"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str())
+                    .filter(|name| validate_repo(name).is_ok())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            repositories.sort();
+            repositories.dedup();
+            if repositories.is_empty() {
+                prompt("CMP context repository (owner/name)", "")?
+            } else {
+                let mut options = repositories.clone();
+                options.push("Create a new context repository...".into());
+                let labels: Vec<&str> = options.iter().map(String::as_str).collect();
+                let selected = cmp_tui::choose("Which CMP repository?", &labels, 0)?;
+                if selected == repositories.len() {
+                    prompt("New repository (owner/name)", "")?
+                } else {
+                    repositories[selected].clone()
+                }
+            }
+        }
+    };
+    validate_repo(&repo)?;
+    let preserve_existing = if path.exists() && !flag(args, "--force") {
+        let current = load_file(&path)?;
+        if current.backend != cfg.backend
+            || current.endpoint != cfg.endpoint
+            || current
+                .repository
+                .as_deref()
+                .is_some_and(|name| name != repo)
+        {
+            return Err(
+                "Project already has different CMP settings. Use --force to replace explicitly"
+                    .into(),
+            );
+        }
+        // Project setup can leave a repository unbound; init can fill it in.
+        // If the binding already matches, leave it untouched.
+        current.repository.as_deref() == Some(repo.as_str())
+    } else {
+        false
+    };
+    if let Some(c) = &cli {
+        let repositories = c.list_repositories()?;
+        let found = repositories["repositories"]
+            .as_array()
+            .is_some_and(|list| list.iter().any(|item| item.as_str() == Some(&repo)));
+        if !found {
+            let create = flag(args, "--create")
+                || (!noninteractive
+                    && cmp_tui::confirm(
+                        &format!("Repository {repo} does not exist. Create it now?"),
+                        true,
+                    )?);
+            if create {
+                let visibility = match argument(args, "--visibility") {
+                    Some(value) => value,
+                    None if noninteractive => "private".into(),
+                    None => {
+                        let choices = [
+                            "Private · only permitted members",
+                            "Public · visible to everyone",
+                        ];
+                        if cmp_tui::choose("Repository visibility", &choices, 0)? == 0 {
+                            "private".into()
+                        } else {
+                            "public".into()
+                        }
+                    }
+                };
+                if visibility != "private" && visibility != "public" {
+                    return Err("Visibility must be private or public".into());
+                }
+                c.request(
+                    "POST",
+                    "/v1/repos",
+                    Some(json!({"id":repo,"visibility":visibility})),
+                )?;
+            } else {
+                return Err(
+                    "Repository not accessible. Use --create or select an existing repository"
+                        .into(),
+                );
+            }
+        }
+    }
+    cfg.repository = Some(repo.clone());
+    if !preserve_existing {
+        save_config(&path, &cfg)?;
+    }
+    let docs = find_docs(&env::current_dir()?)?;
+    cmp_tui::success(format!(
+        "CMP project initialized: {repo} ({})",
+        path.display()
+    ));
+    if !docs.is_empty() {
+        println!(
+            "Found {} documentation sources. No files were uploaded.",
+            docs.len()
+        );
+        if !noninteractive
+            && !flag(args, "--skip-import")
+            && cmp_tui::confirm("Generate a documentation review prompt?", true)?
+        {
+            let review = path.parent().unwrap().join("import-review.md");
+            if !review.exists() {
+                let mut content=String::from("# CMP context evidence review\n\nVerify CMP MCP access before proposing any changes. Extract sourced claims, timestamps, and contradictions; retain both claims until reviewed. Do not upload secrets or overwrite existing records.\n\nDocuments to review:\n");
+                for item in &docs {
+                    content.push_str(&format!("- {}\n", item.display()))
+                }
+                fs::write(&review, content)?;
+                println!("Review prompt: {}", review.display());
+            }
+        }
+    }
+    if !noninteractive && cmp_tui::confirm("Install CMP MCP for an agent?", true)? {
+        let choices = ["Claude Code", "Codex", "OpenCode"];
+        let host = ["claude", "codex", "opencode"]
+            [cmp_tui::choose("Which agent should CMP connect to?", &choices, 0)?];
+        cmp_agents::install(host)?;
+        println!("CMP MCP installed. Hooks require a supported session backend and are not installed automatically.");
+    }
+    println!("Next: cmp doctor");
+    Ok(())
+}
+fn find_docs(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut results = Vec::new();
+    fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Result<()> {
+        if depth > 8 || out.len() >= 200 {
+            return Ok(());
+        }
+        for ent in fs::read_dir(dir)? {
+            let ent = ent?;
+            let path = ent.path();
+            if ent.file_type()?.is_symlink() {
+                continue;
+            }
+            let name = ent.file_name().to_string_lossy().to_lowercase();
+            if ent.file_type()?.is_dir() {
+                if [
+                    ".git",
+                    ".cmp",
+                    "node_modules",
+                    "target",
+                    "dist",
+                    "build",
+                    "out",
+                    ".next",
+                    ".venv",
+                ]
+                .contains(&name.as_str())
+                {
+                    continue;
+                }
+                walk(root, &path, depth + 1, out)?;
+            } else if ent.file_type()?.is_file() {
+                let ext = path
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if ["md", "mdx", "mmd", "mermaid", "puml"].contains(&ext.as_str())
+                    && ent.metadata()?.len() <= 1024 * 1024
+                    && !name.starts_with(".env")
+                {
+                    if let Ok(relative) = path.strip_prefix(root) {
+                        out.push(relative.to_path_buf())
+                    }
+                }
+            }
+            if out.len() >= 200 {
+                break;
+            }
+        }
+        Ok(())
+    }
+    walk(root, root, 0, &mut results)?;
+    results.sort();
+    Ok(results)
+}
+fn command(args: Vec<String>) -> Result<()> {
+    if args.is_empty() {
+        return help();
+    }
+    match args[0].as_str() {
+        "--help" | "-h" | "help" => help(),
+        "--version" | "-V" | "version" => {
+            println!("cmp {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        "setup" => setup(&args[1..]),
+        "login" => login(&args[1..]),
+        "logout" => logout(),
+        "auth" if args.get(1).is_some_and(|x| x == "status") => status(),
+        "status" => status(),
+        "doctor" => doctor(&args[1..]),
+        "init" | "int" => init(&args[1..]),
+        "mcp" if args.get(1).is_some_and(|x| x == "serve") => cmp_mcp::serve(),
+        "agent" if args.get(1).is_some_and(|x| x == "list") => {
+            cmp_agents::list();
+            Ok(())
+        }
+        "agent" if args.get(1).is_some_and(|x| x == "install") => cmp_agents::install(
+            args.get(2)
+                .map(String::as_str)
+                .ok_or("Usage: cmp agent install claude|codex|opencode")?,
+        ),
+        "agent" if args.get(1).is_some_and(|x| x == "remove") => cmp_agents::remove(
+            args.get(2)
+                .map(String::as_str)
+                .ok_or("Usage: cmp agent remove claude|codex|opencode")?,
+        ),
+        "config" if args.get(1).is_some_and(|x| x == "show") => status(),
+        "repo" if args.get(1).is_some_and(|x| x == "list") => {
+            let (cfg, _) = load_config()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&client(&cfg)?.list_repositories()?)?
+            );
+            Ok(())
+        }
+        "repo" if args.get(1).is_some_and(|x| x == "create") => {
+            let repo = args
+                .get(2)
+                .ok_or("Usage: cmp repo create owner/name [--visibility private|public]")?;
+            validate_repo(repo)?;
+            let visibility = argument(&args, "--visibility").unwrap_or_else(|| "private".into());
+            if visibility != "private" && visibility != "public" {
+                return Err("Visibility must be private or public".into());
+            }
+            let (cfg, _) = load_config()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&client(&cfg)?.request(
+                    "POST",
+                    "/v1/repos",
+                    Some(json!({"id":repo,"visibility":visibility}))
+                )?)?
+            );
+            Ok(())
+        }
+        "head" | "snapshot" => {
+            let (cfg, _) = load_config()?;
+            let repo = cfg
+                .repository
+                .clone()
+                .ok_or("No repo configured. Run cmp init")?;
+            let reference = args.get(1).map(String::as_str).unwrap_or(&cfg.branch);
+            let segment = if args[0] == "head" {
+                "head?branch="
+            } else {
+                "records?ref="
+            };
+            let path = format!(
+                "/v1/repos/{}/{}{}",
+                url::form_urlencoded::byte_serialize(repo.as_bytes()).collect::<String>(),
+                segment,
+                url::form_urlencoded::byte_serialize(reference.as_bytes()).collect::<String>()
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&client(&cfg)?.request("GET", &path, None)?)?
+            );
+            Ok(())
+        }
+        "branch" if args.get(1).is_some_and(|x| x == "create") => {
+            let name = args.get(2).ok_or("Usage: cmp branch create name [from]")?;
+            let (cfg, _) = load_config()?;
+            let repo = cfg
+                .repository
+                .clone()
+                .ok_or("No repo configured. Run cmp init")?;
+            let path = format!(
+                "/v1/repos/{}/branches",
+                url::form_urlencoded::byte_serialize(repo.as_bytes()).collect::<String>()
+            );
+            let from = args.get(3).map(String::as_str).unwrap_or(&cfg.branch);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&client(&cfg)?.request(
+                    "POST",
+                    &path,
+                    Some(json!({"name":name,"from":from}))
+                )?)?
+            );
+            Ok(())
+        }
+        "commit" => {
+            let file = args.get(1).ok_or("Usage: cmp commit <changes.json>")?;
+            let data = fs::metadata(file)?;
+            if !data.is_file() || data.len() > 5_000_000 {
+                return Err("Commit file must be a JSON file under 5 MB".into());
+            }
+            let mut payload: Value = serde_json::from_slice(&fs::read(file)?)?;
+            if !payload["changes"].is_array() || !payload["message"].is_string() {
+                return Err("Commit JSON requires message and changes array".into());
+            }
+            let (cfg, _) = load_config()?;
+            let repo = cfg
+                .repository
+                .clone()
+                .ok_or("No repo configured. Run cmp init")?;
+            let branch = payload["branch"].as_str().unwrap_or(&cfg.branch).to_owned();
+            // Never replace an explicit CAS precondition with a fresh head:
+            // that would silently accept stale edits from another writer.
+            let explicit = explicit_commit_head(&payload)?.map(str::to_owned);
+            let sdk = client(&cfg)?;
+            let expected = if let Some(head) = explicit {
+                head
+            } else {
+                let path = format!(
+                    "/v1/repos/{}/head?branch={}",
+                    url::form_urlencoded::byte_serialize(repo.as_bytes()).collect::<String>(),
+                    url::form_urlencoded::byte_serialize(branch.as_bytes()).collect::<String>()
+                );
+                let current = sdk.request("GET", &path, None)?;
+                current["head"]
+                    .as_str()
+                    .ok_or("Branch head not returned")?
+                    .to_owned()
+            };
+            payload["branch"] = json!(branch);
+            payload["expectedHead"] = json!(expected);
+            payload["authorId"] = json!("cmp-cli");
+            let commit_path = format!(
+                "/v1/repos/{}/commits",
+                url::form_urlencoded::byte_serialize(repo.as_bytes()).collect::<String>()
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&sdk.request("POST", &commit_path, Some(payload))?)?
+            );
+            Ok(())
+        }
+        "diff" => {
+            let (cfg, _) = load_config()?;
+            let repo = cfg
+                .repository
+                .clone()
+                .ok_or("No repo configured. Run cmp init")?;
+            let from = args.get(1).map(String::as_str).unwrap_or("main");
+            let to = args.get(2).map(String::as_str).unwrap_or(&cfg.branch);
+            let path = format!(
+                "/v1/repos/{}/diff?from={}&to={}",
+                url::form_urlencoded::byte_serialize(repo.as_bytes()).collect::<String>(),
+                url::form_urlencoded::byte_serialize(from.as_bytes()).collect::<String>(),
+                url::form_urlencoded::byte_serialize(to.as_bytes()).collect::<String>()
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&client(&cfg)?.request("GET", &path, None)?)?
+            );
+            Ok(())
+        }
+        "merge" => {
+            let (cfg, _) = load_config()?;
+            let repo = cfg
+                .repository
+                .clone()
+                .ok_or("No repo configured. Run cmp init")?;
+            let source = args.get(1).ok_or("Usage: cmp merge <source> [target]")?;
+            let target = args.get(2).map(String::as_str).unwrap_or("main");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &client(&cfg)?.merge(&repo, source, target, "cmp-cli")?
+                )?
+            );
+            Ok(())
+        }
+        _ => Err(
+            "Unknown/unimplemented command. Use cmp --help for currently supported commands".into(),
+        ),
+    }
+}
+fn help() -> Result<()> {
+    println!(
+        r#"CMP context CLI (Rust)
+  cmp setup     Configure global ~/.cmp/config.toml or project .cmp/config.toml
+  cmp login     Authenticate with CMP Cloud in a browser via OAuth PKCE
+  cmp logout    Revoke CMP CLI credentials
+  cmp init      Bind current project to a context repository
+  cmp status    Show effective config and auth state
+  cmp doctor    Check backend capabilities and authentication
+  cmp repo list | repo create owner/name [--visibility private|public]
+  cmp head [branch] | snapshot [revision]
+  cmp branch create name [from] | cmp commit <changes.json>
+  cmp diff [from] [to] | merge <source> [target]
+  cmp mcp serve  Serve authenticated CMP MCP tools over stdio
+  cmp agent list | install claude|codex|opencode | remove <host>
+  cmp --version
+
+Project config overrides global. Cloud credentials live in the OS credential vault,
+not in either .cmp config. The existing cmp-context and cmp-companion remain available.
+Future: agent installers, full documentation import, Cloud managed sessions.
+"#
+    );
+    Ok(())
+}
+fn main() {
+    if let Err(e) = command(env::args().skip(1).collect()) {
+        eprintln!("cmp: {e}");
+        std::process::exit(1);
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn block_http_remote() {
+        assert!(validate_endpoint("http://server.internal:8787").is_err());
+        assert!(validate_endpoint("https://cmp.example").is_ok());
+        assert!(validate_endpoint(LOCAL).is_ok());
+        assert!(validate_endpoint("https://person:pass@example.com").is_err());
+        assert_eq!(
+            normalize_endpoint("https://CLOUD.cmp.chat/").unwrap(),
+            CLOUD
+        );
+        assert_eq!(
+            normalize_endpoint("https://cloud.cmp.chat:443/").unwrap(),
+            CLOUD
+        );
+    }
+    #[test]
+    fn discovers_nearest_project_from_nested_subdirectory() {
+        let root = env::temp_dir().join(format!("cmp-config-{}", random_short()));
+        fs::create_dir_all(root.join("src/deep")).unwrap();
+        fs::create_dir_all(root.join(".cmp")).unwrap();
+        fs::write(root.join(".cmp/config.toml"), "version=1").unwrap();
+        let expected = root.join(".cmp/config.toml");
+        assert_eq!(nearest_project_file(&root.join("src/deep")), Some(expected));
+        fs::create_dir_all(root.join("src/.cmp")).unwrap();
+        fs::write(root.join("src/.cmp/config.toml"), "version=1").unwrap();
+        assert_eq!(
+            nearest_project_file(&root.join("src/deep")),
+            Some(root.join("src/.cmp/config.toml"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn repo_identifier_validation() {
+        assert!(validate_repo("user/repository").is_ok());
+        assert!(validate_repo("/bad").is_err());
+        assert!(validate_repo("user/bad/extra").is_err());
+    }
+    #[test]
+    fn toml_roundtrip() {
+        let mut cfg = Config::new("cloud", CLOUD);
+        cfg.repository = Some("user/docs".into());
+        let decoded: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(decoded, cfg);
+    }
+    #[test]
+    fn explicit_commit_cas_head_is_not_replaced() {
+        let stale = "a".repeat(64);
+        let payload = json!({"expectedHead":stale});
+        assert_eq!(
+            explicit_commit_head(&payload).unwrap(),
+            Some(stale.as_str())
+        );
+        assert_eq!(explicit_commit_head(&json!({})).unwrap(), None);
+        for invalid in [
+            json!({"expectedHead":null}),
+            json!({"expectedHead":42}),
+            json!({"expectedHead":"abc"}),
+            json!({"expectedHead":"z".repeat(64)}),
+        ] {
+            assert!(explicit_commit_head(&invalid).is_err());
+        }
+    }
+    #[test]
+    fn no_symlink_import() {
+        let root = env::temp_dir().join(format!("cmp-cli-test-{}", random_short()));
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs/guide.md"), "document").unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/secret.md"), "secret").unwrap();
+        let found = find_docs(&root).unwrap();
+        assert_eq!(found, vec![PathBuf::from("docs/guide.md")]);
+        fs::remove_dir_all(root).unwrap();
+    }
+}

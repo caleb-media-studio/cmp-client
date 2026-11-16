@@ -1,0 +1,203 @@
+{
+  "schemaVersion": 1,
+  "protocol": "CMP v0.1 development reference",
+  "priorities": {
+    "phase1": [
+      "typescript",
+      "python",
+      "go",
+      "rust"
+    ],
+    "phase2": [
+      "java",
+      "kotlin",
+      "csharp",
+      "php",
+      "ruby",
+      "swift"
+    ]
+  },
+  "languages": [
+    {
+      "id": "typescript",
+      "name": "TypeScript / JavaScript",
+      "phase": 1,
+      "status": "implemented-development",
+      "path": "packages/sdk",
+      "package": "@cmp-chat/sdk",
+      "runtime": "Node.js 24+ or modern browser",
+      "transport": [
+        "HTTP RPC",
+        "WebSocket"
+      ],
+      "requiredTests": [
+        "typecheck",
+        "server-integration",
+        "agent-companion",
+        "replay",
+        "archive"
+      ]
+    },
+    {
+      "id": "python",
+      "name": "Python",
+      "phase": 1,
+      "status": "implemented-development",
+      "path": "sdk/python",
+      "package": "cmp-context",
+      "runtime": "Python 3.11+",
+      "transport": [
+        "HTTP RPC"
+      ],
+      "requiredTests": [
+        "unit",
+        "live-server"
+      ]
+    },
+    {
+      "id": "go",
+      "name": "Go",
+      "phase": 1,
+      "status": "implemented-development",
+      "path": "sdk/go",
+      "package": "cmp-chat/go",
+      "runtime": "Go 1.23+",
+      "transport": [
+        "HTTP RPC"
+      ],
+      "requiredTests": [
+        "unit",
+        "live-server"
+      ]
+    },
+    {
+      "id": "rust",
+      "name": "Rust",
+      "phase": 1,
+      "status": "implemented-development",
+      "path": "sdk/rust",
+      "package": "cmp-context",
+      "runtime": "Rust 1.88+",
+      "transport": [
+        "HTTP RPC"
+      ],
+      "requiredTests": [
+        "unit",
+        "live-server"
+      ]
+    },
+    {
+      "id": "java",
+      "name": "Java",
+      "phase": 2,
+      "status": "planned",
+      "path": "sdk/java",
+      "package": "io.cmpchat:cmp-sdk",
+      "runtime": "JDK 21+",
+      "transport": [
+        "HTTP RPC",
+        "WebSocket planned"
+      ],
+      "requiredTests": [
+        "junit",
+        "maven-package",
+        "live-server"
+      ]
+    },
+    {
+      "id": "kotlin",
+      "name": "Kotlin",
+      "phase": 2,
+      "status": "planned",
+      "path": "sdk/kotlin",
+      "package": "io.cmpchat:cmp-sdk-kotlin",
+      "runtime": "JVM 21+ / Kotlin 2.x",
+      "transport": [
+        "HTTP RPC",
+        "WebSocket planned"
+      ],
+      "requiredTests": [
+        "kotest",
+        "gradle-package",
+        "live-server"
+      ]
+    },
+    {
+      "id": "csharp",
+      "name": "C#",
+      "phase": 2,
+      "status": "planned",
+      "path": "sdk/csharp",
+      "package": "Cmp.Sdk",
+      "runtime": ".NET 8+",
+      "transport": [
+        "HTTP RPC",
+        "WebSocket planned"
+      ],
+      "requiredTests": [
+        "dotnet-test",
+        "nuget-package",
+        "live-server"
+      ]
+    },
+    {
+      "id": "php",
+      "name": "PHP",
+      "phase": 2,
+      "status": "planned",
+      "path": "sdk/php",
+      "package": "cmpchat/sdk",
+      "runtime": "PHP 8.3+",
+      "transport": [
+        "HTTP RPC"
+      ],
+      "requiredTests": [
+        "phpunit",
+        "composer-validate",
+        "live-server"
+      ]
+    },
+    {
+      "id": "ruby",
+      "name": "Ruby",
+      "phase": 2,
+      "status": "planned",
+      "path": "sdk/ruby",
+      "package": "cmp-sdk",
+      "runtime": "Ruby 3.2+",
+      "transport": [
+        "HTTP RPC"
+      ],
+      "requiredTests": [
+        "minitest",
+        "gem-build",
+        "live-server"
+      ]
+    },
+    {
+      "id": "swift",
+      "name": "Swift",
+      "phase": 2,
+      "status": "planned",
+      "path": "sdk/swift",
+      "package": "CMPClient",
+      "runtime": "Swift 6+",
+      "transport": [
+        "HTTP RPC",
+        "WebSocket planned"
+      ],
+      "requiredTests": [
+        "swift-test",
+        "swift-package",
+        "live-server"
+      ]
+    }
+  ],
+  "releaseRules": [
+    "No language is marked supported until its package builds, typed contracts pass, and it runs live conformance against cmp-server.",
+    "Every SDK must support repository context APIs, canonical agent join/discovery, contracts/claims, session DAG archive, local opt-out and deletion.",
+    "All SDKs use semantic versioning, idempotent retries for safe operations, request deadlines, and error codes preserving HTTP status.",
+    "No SDK automatically collects personal sessions or hidden reasoning. Archive capture requires approved organization policy and explicit local configuration.",
+    "Credential and token material must never appear in model-generated Code Mode source, logs, or generated documentation."
+  ]
+}
