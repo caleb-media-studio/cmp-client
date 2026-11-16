@@ -1,6 +1,6 @@
-//! Local stdio MCP adapter. CMP credentials remain in the Rust CLI keychain;
+//! Local stdio MCP adapter. Remote credentials remain in the chosen CLI vault;
 //! agent hosts receive only an executable path, never bearer or refresh tokens.
-use super::{client, load_config, validate_repo, Config, Result};
+use super::{context_request, load_config, validate_repo, Config, Result};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 
@@ -56,9 +56,8 @@ fn tools() -> Value {
     ])
 }
 fn tool_call(name: &str, args: &Value, config: &Config) -> Result<Value> {
-    let api = client(config)?;
     if name == "cmp_repositories" {
-        return api.list_repositories();
+        return context_request(config, "GET", "/v1/repos", None);
     }
     let id = repo(args, config)?;
     let prefix = format!("/v1/repos/{}", encode(&id));
@@ -67,7 +66,7 @@ fn tool_call(name: &str, args: &Value, config: &Config) -> Result<Value> {
         .and_then(Value::as_str)
         .unwrap_or(&config.branch);
     match name {
-        "cmp_context_head" => Ok(api.request(
+        "cmp_context_head" => Ok(context_request(config,
             "GET",
             &format!("{prefix}/head?branch={}", encode(branch)),
             None,
@@ -77,7 +76,7 @@ fn tool_call(name: &str, args: &Value, config: &Config) -> Result<Value> {
                 .get("ref")
                 .and_then(Value::as_str)
                 .unwrap_or(&config.branch);
-            Ok(api.request(
+            Ok(context_request(config,
                 "GET",
                 &format!("{prefix}/records?ref={}", encode(refid)),
                 None,
@@ -86,7 +85,7 @@ fn tool_call(name: &str, args: &Value, config: &Config) -> Result<Value> {
         "cmp_context_diff" => {
             let from = required(args, "from")?;
             let to = required(args, "to")?;
-            Ok(api.request(
+            Ok(context_request(config,
                 "GET",
                 &format!("{prefix}/diff?from={}&to={}", encode(from), encode(to)),
                 None,
@@ -102,7 +101,7 @@ fn tool_call(name: &str, args: &Value, config: &Config) -> Result<Value> {
             if changes.len() > 500 || message.len() > 500 {
                 return Err("Commit exceeds allowed size".into());
             }
-            Ok(api.request(
+            Ok(context_request(config,
                 "POST",
                 &format!("{prefix}/commits"),
                 Some(json!({
@@ -117,7 +116,7 @@ fn tool_call(name: &str, args: &Value, config: &Config) -> Result<Value> {
                 .get("target")
                 .and_then(Value::as_str)
                 .unwrap_or(&config.branch);
-            Ok(api.request(
+            Ok(context_request(config,
                 "POST",
                 &format!("{prefix}/merge"),
                 Some(json!({
@@ -131,7 +130,7 @@ fn tool_call(name: &str, args: &Value, config: &Config) -> Result<Value> {
                 .get("from")
                 .and_then(Value::as_str)
                 .unwrap_or(&config.branch);
-            Ok(api.request(
+            Ok(context_request(config,
                 "POST",
                 &format!("{prefix}/branches"),
                 Some(json!({"name":name,"from":from})),

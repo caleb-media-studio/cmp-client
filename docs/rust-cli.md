@@ -7,7 +7,8 @@ Build from sdk/rust with cargo build --release --bin cmp. One Rust executable ru
 - Global: ~/.cmp/config.toml, inside ~/.cmp/
 - Project: PROJECT_ROOT/.cmp/config.toml, inside that project's .cmp/
 - Project overrides global. CMP_CONFIG chooses an explicit file. CMP_ENDPOINT and CMP_REPOSITORY are opt-in environment overrides.
-- Both TOML files contain only the endpoint, backend, repository and branch. Refresh credentials are stored in the operating system secure credential vault, never in a tracked project.
+- TOML stores backend, endpoint, repository, branch and the explicit `streaming` boolean. The offline store lives at `<config-directory>/state/`, not in Git metadata.
+- Refresh tokens never live in TOML. After OAuth, the user chooses an OS credential vault, a passphrase-encrypted file (`~/.cmp/credentials.enc`), or no persistence. The encrypted fallback uses Argon2id and XChaCha20-Poly1305; the decryption password is never stored in the project.
 - Self-hosted mode accepts loopback HTTP or HTTPS. It currently uses CMP_DEV_TOKEN for the local development server, not a CMP Cloud login. Unencrypted remote HTTP is rejected.
 
 ## Interactive onboarding
@@ -17,7 +18,7 @@ Use **Up/Down arrows**, **Enter** to select, and **Escape** to cancel choices an
 Choice-based questions no longer require typing their names:
 
 - Global (~/.cmp) or current-project (./.cmp) setup
-- CMP Cloud or self-hosted CMP server
+- CMP Cloud, self-hosted CMP server or embedded local/offline storage, with an explicit streaming opt-in
 - Selecting from accessible context repositories
 - Offering to create a missing repository, then private or public visibility
 - Selecting Claude Code, Codex, or OpenCode for MCP installation
@@ -33,11 +34,13 @@ in the same directory if desired.
 
 ## Implemented commands
 
-cmp setup --scope global|project --backend cloud|local --endpoint URL --repo owner/name
-cmp login [--no-browser]
+cmp setup --scope global|project --backend cloud|local|offline --endpoint URL --repo owner/name [--streaming|--no-streaming]
+cmp login [--no-browser] [--credential-store keychain|encrypted|none]
 cmp logout
 cmp auth status
-cmp init --repo owner/name [--create] [--visibility private|public] [--offline]
+cmp init --repo owner/name [--create] [--visibility private|public] [--offline] [--streaming|--no-streaming]
+cmp stream status
+cmp stream push
 cmp status
 cmp doctor [--offline]
 cmp config show
@@ -56,11 +59,21 @@ cmp agent remove claude|codex|opencode
 
 The CMP repository is versioned context and evidence, not the same as a Git repository. Commit uses a bounded JSON file and an optimistic branch-head check. Repository creation defaults to private.
 
+## Embedded offline context and streaming privacy
+
+Choose `cmp setup --scope project --backend offline --no-interactive` (or **Local / Offline** from the interactive menu) to keep context records, branch heads and immutable snapshots on-device in `.cmp/state/`. Context commands and `cmp mcp serve` operate against this embedded store without a server. Offline merges currently support fast-forward ancestry only. The CLI never creates `.git/`.
+
+No network request is made for context operations when `streaming = false`. The CLI creates `.cmp/.gitignore` with `state/` to help protect local records from accidental Git commits. **Local records are owner-private on Unix but not encrypted at rest**. Never put credentials or private secrets in context records.
+
+Streaming is opt-in in `cmp setup` or `cmp init`, or via `--streaming`. When enabled, new local changes are saved before an authenticated upload attempt. Failed operations remain in `.cmp/state/stream-outbox.json`; run `cmp stream status` or `cmp stream push` to inspect and retry. Known remote branch divergence stops uploads instead of overwriting remote changes. `--no-streaming` disables further uploads.
+
+**Current limitation:** enabling streaming does not retroactively backfill earlier offline context history. That requires an explicit migration flow. CMP Cloud uses `cmp login`; self-hosted development servers use `CMP_DEV_TOKEN`. There is no background synchronization daemon when the CLI is closed.
+
 ## Browser login and connected apps
 
 CMP CLI binds 127.0.0.1 on an OS-assigned ephemeral port, generates PKCE S256 and random state, and opens CMP Cloud authorization in the browser. The signed-in user explicitly approves read/write/offline scopes. Cloud issues one-time codes, short-lived opaque access tokens and rotating refresh tokens. Tokens are validated by the managed API against the existing RLS-protected PostgreSQL database and never authorize browser account/billing/admin endpoints.
 
-CMP Cloud Settings > Connected apps displays and revokes authorized sessions. Tokens never enter configuration files or MCP host commands. No extra always-on infrastructure was created.
+CMP Cloud Settings > Connected apps displays and revokes authorized sessions. After the OAuth callback returns, the CLI asks **"Would you like to save in keychain?"**. Choose a passphrase-encrypted file when a system credential vault is unsupported or unavailable, or choose no persistence. For noninteractive login, explicitly select `--credential-store encrypted|keychain|none`; otherwise persistence defaults to none. When encrypted-file storage is selected, normal interactive CLI commands prompt for its passphrase. Headless MCP integrations require `CMP_CREDENTIAL_PASSPHRASE` in the parent process environment and must not store it in tracked configuration or MCP command arguments. Tokens never enter project configuration. No extra always-on infrastructure was created.
 
 ## MCP and agent integration
 
