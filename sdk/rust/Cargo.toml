@@ -13,7 +13,7 @@ tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 url = "2"
 toml = "0.8"
 rand = "0.8"
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
 keyring = { version = "3.6", default-features = false, features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
 fs2 = "0.4"
