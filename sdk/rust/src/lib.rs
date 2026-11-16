@@ -26,7 +26,9 @@ impl Client {
  }
  pub fn request(&self,method:&str,path:&str,body:Option<Value>)->Result<Value,Box<dyn Error>> {
   let url=format!("{}{}",self.endpoint,path);
-  let req=ureq::request(method,&url).set("Authorization",&format!("Bearer {}",self.token)).set("Content-Type","application/json");
+  // Never follow redirects with the CMP bearer token across origins.
+  let agent=ureq::AgentBuilder::new().redirects(0).build();
+  let req=agent.request(method,&url).set("Authorization",&format!("Bearer {}",self.token)).set("Content-Type","application/json");
   let response=if let Some(value)=body{req.send_json(value)?}else{req.call()?};
   Ok(response.into_json::<Value>()?)
  }
@@ -72,3 +74,72 @@ mod tests{
 pub mod coordination;
 
 pub mod coordination_extra;
+
+/// Stable, versioned CMP JSON repository transport. This is not Git smart HTTP.
+pub fn cmp_transport_path(repo:&str)->Result<String,Box<dyn Error>> {
+    let parts:Vec<&str>=repo.split('/').collect();
+    if parts.len()!=2 || parts.iter().any(|part| part.is_empty()||part.len()>100
+        || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        || *part=="." || *part=="..") {
+        return Err("CMP repository must have owner/name format".into());
+    }
+    Ok(format!("/{}/{}.cmp",parts[0],parts[1]))
+}
+/// Parse a CMP remote URL without ever accepting a different origin than the
+/// configured server, preventing redirected/cross-host bearer credential leaks.
+pub fn cmp_repository_from_url(address:&str,endpoint:&str)->Result<String,Box<dyn Error>> {
+    let url=url::Url::parse(address)?;
+    let base=url::Url::parse(endpoint)?;
+    if url.origin()!=base.origin() || url.username()!="" || url.password().is_some()
+        || url.query().is_some() || url.fragment().is_some() {
+        return Err("CMP clone URL must match the configured server and contain no query or credentials".into());
+    }
+    let segments=url.path_segments().ok_or("Invalid CMP remote URL")?.collect::<Vec<_>>();
+    if segments.len()!=2 || !segments[1].ends_with(".cmp") {
+        return Err("Expected https://server/owner/repository.cmp".into());
+    }
+    let owner=percent_encoding::percent_decode_str(segments[0]).decode_utf8()?;
+    let name=percent_encoding::percent_decode_str(&segments[1][..segments[1].len()-4]).decode_utf8()?;
+    let repo=format!("{owner}/{name}");
+    cmp_transport_path(&repo)?;
+    Ok(repo)
+}
+impl Client {
+    pub fn cmp_remote_url(&self,repo:&str)->Result<String,Box<dyn Error>>{
+        Ok(self.endpoint.clone()+&cmp_transport_path(repo)?)
+    }
+    pub fn cmp_manifest(&self,repo:&str)->Result<Value,Box<dyn Error>>{
+        self.request("GET",&cmp_transport_path(repo)?,None)
+    }
+    pub fn cmp_refs(&self,repo:&str)->Result<Value,Box<dyn Error>>{
+        self.request("GET",&format!("{}?view=refs",cmp_transport_path(repo)?),None)
+    }
+    pub fn cmp_snapshot(&self,repo:&str,reference:&str)->Result<Value,Box<dyn Error>>{
+        if reference.is_empty() || reference.len()>128 || reference.bytes().any(|b| b.is_ascii_control()) {
+            return Err("Invalid CMP reference".into());
+        }
+        let refencoded=url::form_urlencoded::byte_serialize(reference.as_bytes()).collect::<String>();
+        self.request("GET",&format!("{}?view=snapshot&ref={refencoded}",cmp_transport_path(repo)?),None)
+    }
+    pub fn cmp_push(&self,repo:&str,payload:Value)->Result<Value,Box<dyn Error>>{
+        self.request("POST",&cmp_transport_path(repo)?,Some(payload))
+    }
+}
+#[cfg(test)]
+mod transport_tests {
+ use super::*;
+ #[test] fn transport_paths_and_url_origin_are_checked(){
+  assert_eq!(cmp_transport_path("team/repo-first").unwrap(),"/team/repo-first.cmp");
+  for bad in ["team/../repo","team/repo/x","/repo","team/.","team/.."] {
+   assert!(cmp_transport_path(bad).is_err(),"{bad}");
+  }
+  let base="https://cloud.cmp.chat";
+  assert_eq!(cmp_repository_from_url("https://cloud.cmp.chat/team/repo-first.cmp",base).unwrap(),"team/repo-first");
+  for bad in ["https://evil.example/team/repo-first.cmp",
+   "https://cloud.cmp.chat@evil.example/team/repo-first.cmp",
+   "https://cloud.cmp.chat/team/repo-first.cmp?token=x",
+   "https://cloud.cmp.chat/team/repo-first.git"] {
+   assert!(cmp_repository_from_url(bad,base).is_err(),"{bad}");
+  }
+ }
+}

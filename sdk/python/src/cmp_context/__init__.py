@@ -7,6 +7,20 @@ from urllib.parse import quote
 class CMPError(Exception):
     pass
 
+from urllib.request import build_opener, HTTPRedirectHandler
+
+class _RejectTransportRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise CMPError("CMP transport redirects are not permitted")
+
+def cmp_transport_path(repository: str) -> str:
+    parts = repository.split("/")
+    if len(parts) != 2 or any(not part or len(part) > 100 or part in (".", "..")
+        or not all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in part)
+        for part in parts):
+        raise CMPError("CMP repository must have owner/name format")
+    return f"/{quote(parts[0], safe='')}/{quote(parts[1], safe='')}.cmp"
+
 class CMPClient:
     def __init__(self, endpoint: str, token: str):
         self.endpoint = endpoint.rstrip("/")
@@ -25,6 +39,32 @@ class CMPClient:
                 return json.load(res)
         except HTTPError as error:
             raise CMPError(f"CMP HTTP {error.code}: {error.read().decode()}") from error
+
+    def _cmp_transport(self, path: str, method: str = "GET", body=None):
+        payload = None if body is None else json.dumps(body).encode("utf-8")
+        req = Request(self.endpoint + path, method=method, data=payload,
+                      headers={"Authorization": f"Bearer {self.token}",
+                               "Content-Type": "application/json"})
+        try:
+            with build_opener(_RejectTransportRedirects()).open(req, timeout=15) as response:
+                return json.load(response)
+        except HTTPError as error:
+            raise CMPError(f"CMP transport HTTP {error.code}") from error
+
+    def cmp_manifest(self, repository: str):
+        return self._cmp_transport(cmp_transport_path(repository))
+
+    def cmp_refs(self, repository: str):
+        return self._cmp_transport(cmp_transport_path(repository) + "?view=refs")
+
+    def cmp_snapshot(self, repository: str, ref: str = "main"):
+        if not ref or len(ref) > 128:
+            raise CMPError("Invalid CMP snapshot reference")
+        return self._cmp_transport(cmp_transport_path(repository) +
+                                   f"?view=snapshot&ref={quote(ref, safe='')}")
+
+    def cmp_push(self, repository: str, payload: dict):
+        return self._cmp_transport(cmp_transport_path(repository), "POST", payload)
 
     def list_repositories(self):
         return self._request("/v1/repos")

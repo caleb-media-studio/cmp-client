@@ -1,12 +1,13 @@
 {
   "standardRepo": "caleb-media-studio/cmp-protocol",
-  "standardCommit": "746cea6fa11f82a73b3aba14d34ab57c8ab1dfb3",
+  "standardCommit": "50d9f291af73831d40f26b8a0cf8bf98726ba7d5",
   "package": "@cmp-chat/protocol",
   "files": {
     "package.json": "c61019e5e27b9848c5046b50f5e3f00e75530b299f6b46f73c7ce1130d8dc782",
-    "src/index.ts": "52e149004e6fbacbc9abb8816cb53e4d1bb29521d0abffe2cf5d694c3675ff17",
+    "src/index.ts": "69d6000ac0d0cadca2ade8f35bd050b1f43b24e20f408bfcd5d5d301734bd06e",
     "src/repository.test.ts": "226c0bf3a4fa059f939723e1e28ae25007e2f83889314d7df015e68c4101f11d",
     "src/repository.ts": "72920ba7150f01eb6cfaa636dafd0d3fe60c0d65ad70b31ea158239e35414f18",
+    "src/transport.test.ts": "ff0aba079fe5f1a16e9c8bc339697fc3402f6551ea29f72c588b083fedb445cb",
     "tsconfig.json": "c607f745c956aafe3124c7ecc2c60cc004f02e3ccf7f30f60750f6ca87179060"
   }
 }

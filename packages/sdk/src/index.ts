@@ -1,4 +1,6 @@
-import type { CmpFrame, Change, ContextCommit, KnowledgeRecord } from "@cmp-chat/protocol";
+import {cmpTransportPath} from "@cmp-chat/protocol";
+import type { CmpFrame, Change, ContextCommit, KnowledgeRecord,
+ CmpTransportManifest,CmpTransportRefs,CmpTransportSnapshot } from "@cmp-chat/protocol";
 import type {
  AgentJoinRequest, AgentSession, AgentCredentials, AgentPeer,
  WorkContractProposal, WorkContract, ClaimAcquireRequest, WorkClaim
@@ -62,6 +64,7 @@ export class CMPClient {
     if(!token||token.length>12000)throw new Error("CMP access token is required");
     const response=await fetch(new URL(path,this.options.httpEndpoint),{
       method,headers:{authorization:"Bearer "+token,"content-type":"application/json"},
+      redirect:"error",
       signal:AbortSignal.timeout(this.options.requestTimeoutMs??10000),
       body:body?JSON.stringify(body):undefined
     });
@@ -143,6 +146,21 @@ export class CMPClient {
   closeArchive(auth:AgentCredentials){return this.call("session.close",auth);}
   excludeArchive(auth:AgentCredentials){return this.call("session.exclude",auth);}
   deleteArchive(auth:AgentCredentials){return this.call("session.delete",auth);}
+  // Versioned CMP JSON repository transport, not Git smart HTTP.
+  cmpManifest(repo:string){
+    return this.api<CmpTransportManifest>(cmpTransportPath(repo));
+  }
+  cmpRefs(repo:string){
+    return this.api<CmpTransportRefs>(cmpTransportPath(repo)+"?view=refs");
+  }
+  cmpSnapshot(repo:string,ref="main"){
+    if(!ref||ref.length>128)throw new Error("Invalid CMP snapshot reference");
+    return this.api<CmpTransportSnapshot>(cmpTransportPath(repo)+
+      "?view=snapshot&ref="+encodeURIComponent(ref));
+  }
+  cmpPush(repo:string,args:{branch:string;expectedHead:string;authorId:string;message:string;changes:Change[]}){
+    return this.api<ContextCommit>(cmpTransportPath(repo),"POST",args);
+  }
   createRepository(id:string){return this.api<{id:string;head:string}>("/v1/repos","POST",{id});}
   listRepositories(){return this.api<{repositories:string[]}>("/v1/repos");}
   getSnapshot(repo:string,ref="main"){

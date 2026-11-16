@@ -211,3 +211,18 @@ pub fn push(cfg: &Config) -> Result<usize> {
 pub fn pending() -> Result<usize> {
     locked(|root| Ok(load(root)?.queued.len()))
 }
+
+/// Save the remote revision from a snapshot clone so the first opt-in stream
+/// commit compares against the actual remote head rather than overwriting it.
+pub fn record_clone_origin(config_dir:&Path,repo:&str,branch:&str,head:&str)->Result<()> {
+    super::validate_repo(repo)?;
+    if branch.is_empty() || head.len()!=64 || !head.bytes().all(|b|b.is_ascii_hexdigit()) {
+        return Err("Invalid CMP remote tracking metadata".into());
+    }
+    let root=config_dir.join("state");
+    private_dir(&root)?;
+    let mut state=load(&root)?;
+    state.initialized.insert(repo.into());
+    state.acknowledgments.insert(format!("{repo}:{branch}"),head.into());
+    save(&root,&state)
+}

@@ -11,6 +11,8 @@ mod cmp_offline;
 mod cmp_credentials;
 #[path = "cmp/stream.rs"]
 mod cmp_stream;
+#[path = "cmp/gh.rs"]
+mod cmp_gh;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use cmp_context::Client;
 use fs2::FileExt;
@@ -913,10 +915,17 @@ fn find_docs(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(results)
 }
 fn command(args: Vec<String>) -> Result<()> {
+    // Match gh: nested --help never needs a configured server or token.
+    if args.len()>1 && args.iter().skip(1).any(|v| v=="--help"||v=="-h")
+        && matches!(args[0].as_str(),"repo"|"auth"|"config"|"branch"|"api") {
+        cmp_gh::help_category(&args[0]);
+        return Ok(());
+    }
     if args.is_empty() {
         return help();
     }
     match args[0].as_str() {
+        "help" if args.len()>1 => {cmp_gh::help_category(&args[1]);Ok(())},
         "--help" | "-h" | "help" => help(),
         "--version" | "-V" | "version" => {
             println!("cmp {}", env!("CARGO_PKG_VERSION"));
@@ -934,7 +943,13 @@ fn command(args: Vec<String>) -> Result<()> {
             Ok(())
         },
         "logout" => logout(),
-        "auth" if args.get(1).is_some_and(|x| x == "status") => status(),
+        "auth" => cmp_gh::auth(&args[1..]),
+        "browse" => cmp_gh::browse(&args[1..]),
+        "api" => cmp_gh::api(&args[1..]),
+        "repo" if args.get(1).is_some_and(|v| matches!(v.as_str(), "view"|"clone"|"set-default"|"help"|"--help")) || args.len()==1 => cmp_gh::repo(&args[1..]),
+        "config" if args.get(1).is_some_and(|v| matches!(v.as_str(), "list"|"get"|"set"|"help"|"--help")) || args.len()==1 => cmp_gh::config(&args[1..]),
+        "branch" if args.get(1).is_some_and(|v| v=="list") => cmp_gh::branch_list(),
+        "branch" if args.get(1).is_some_and(|v| v=="--help"||v=="help") || args.len()==1 => {cmp_gh::help_category("branch");Ok(())},
         "status" => status(),
         "doctor" => doctor(&args[1..]),
         "init" | "int" => init(&args[1..]),
@@ -967,7 +982,8 @@ fn command(args: Vec<String>) -> Result<()> {
                 .get(2)
                 .ok_or("Usage: cmp repo create owner/name [--visibility private|public]")?;
             validate_repo(repo)?;
-            let visibility = argument(&args, "--visibility").unwrap_or_else(|| "private".into());
+            if flag(&args,"--public") && flag(&args,"--private") {return Err("Choose --public or --private".into());}
+            let visibility = if flag(&args,"--public") {"public".into()} else if flag(&args,"--private") {"private".into()} else {argument(&args,"--visibility").unwrap_or_else(|| "private".into())};
             if visibility != "private" && visibility != "public" {
                 return Err("Visibility must be private or public".into());
             }
@@ -1117,32 +1133,50 @@ fn command(args: Vec<String>) -> Result<()> {
     }
 }
 fn help() -> Result<()> {
-    println!(
-        r#"CMP context CLI (Rust)
-  cmp setup     Configure global ~/.cmp/config.toml or project .cmp/config.toml
-                --backend offline [--streaming | --no-streaming]
-  cmp login     Authenticate with CMP Cloud via OAuth PKCE
-                --credential-store keychain|encrypted|none
-  cmp logout    Revoke CMP CLI credentials
-  cmp init      Bind current project; --offline [--streaming] opts into local storage
-  cmp stream push | status   Retry queued local-to-remote context updates
-  cmp status    Show effective config and auth state
-  cmp doctor    Check backend capabilities and authentication
-  cmp repo list | repo create owner/name [--visibility private|public]
-  cmp head [branch] | snapshot [revision]
-  cmp branch create name [from] | cmp commit <changes.json>
-  cmp diff [from] [to] | merge <source> [target]
-  cmp mcp serve  Serve authenticated CMP MCP tools over stdio
-  cmp agent list | install claude|codex|opencode | remove <host>
-  cmp --version
+    println!(r#"Work with CMP context repositories from the command line.
 
-Project config overrides global. Offline context lives in .cmp/state and never
-uses the network unless streaming is explicitly enabled. CMP Cloud credentials
-can use an OS keychain or a passphrase-encrypted file under ~/.cmp.
-The existing cmp-context and cmp-companion remain available.
-Future: agent installers, full documentation import, Cloud managed sessions.
-"#
-    );
+USAGE
+  cmp <command> <subcommand> [flags]
+
+CORE COMMANDS
+  auth:          Authenticate CMP Cloud and manage saved credentials
+  browse:        Open a context repository in your browser
+  repo:          Create, list, view, clone, and select repositories
+  branch:        Manage context repository branches
+  agent:         Configure agent MCP integration
+
+CONTEXT COMMANDS
+  init:          Connect a project to CMP with .cmp/config.toml
+  head:          Inspect a context branch head
+  snapshot:      Retrieve versioned context records
+  commit:        Commit knowledge changes with compare-and-swap
+  diff:          Compare context revisions
+  merge:         Merge context branches
+  stream:        Manage opt-in local-to-server context streaming
+
+ADDITIONAL COMMANDS
+  api:           Call the configured CMP server API
+  config:        Read and update non-secret CLI settings
+  setup:         Configure Cloud, self-hosted, or offline CMP
+  doctor:        Check the active backend and its capabilities
+  status:        Inspect active configuration and authentication
+  mcp:           Serve CMP tools to AI coding agents
+
+FLAGS
+  --help         Show help for a command
+  --version      Show CMP version
+
+EXAMPLES
+  cmp auth login
+  cmp repo create owner/knowledge --private
+  cmp repo clone https://cloud.cmp.chat/owner/knowledge.cmp
+  cmp repo view owner/knowledge --web
+  cmp branch list
+  cmp api /v1/repos
+
+This is CMP context version control, not a Git implementation.
+GitHub-only categories (issues, PRs, Actions, Codespaces) are not implemented.
+Use `cmp <command> --help` to see available subcommands."#);
     Ok(())
 }
 fn main() {

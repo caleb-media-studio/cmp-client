@@ -72,7 +72,12 @@ func (c *Client) request(ctx context.Context,method,path string,body any,out any
  if err!=nil{return err}
  req.Header.Set("Authorization","Bearer "+c.Token)
  req.Header.Set("Content-Type","application/json")
- resp,err:=c.HTTP.Do(req);if err!=nil{return err}
+ // A CMP access token must never be forwarded to another origin by a redirect.
+ httpClient:=c.HTTP
+ if httpClient==nil {httpClient=http.DefaultClient}
+ guarded:=*httpClient
+ guarded.CheckRedirect=func(*http.Request,[]*http.Request)error{return http.ErrUseLastResponse}
+ resp,err:=guarded.Do(req);if err!=nil{return err}
  defer resp.Body.Close()
  if resp.StatusCode>=300 {
    raw,_:=io.ReadAll(io.LimitReader(resp.Body,4096))
