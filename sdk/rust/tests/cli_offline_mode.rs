@@ -5,6 +5,8 @@ use std::{
     process::{Command, Output},
     time::{SystemTime, UNIX_EPOCH},
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const CLI: &str = env!("CARGO_BIN_EXE_cmp");
 struct Fixture(PathBuf);
 impl Fixture {
@@ -13,8 +15,9 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("cmp-offline-{}-{n}", std::process::id()));
-        fs::create_dir_all(&path).unwrap();
+        let sequence=FIXTURE_SEQUENCE.fetch_add(1,Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("cmp-offline-{}-{n}-{sequence}", std::process::id()));
+        fs::create_dir(&path).unwrap();
         Self(path)
     }
     fn project(&self) -> PathBuf {
