@@ -21,7 +21,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.20.5",
-    "typescript": "^5.9.0"
+    "typescript": "^7.0.2"
   },
   "packageManager": "pnpm@10.34.9",
   "bin": {
