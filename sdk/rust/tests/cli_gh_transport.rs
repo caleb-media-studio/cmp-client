@@ -1,11 +1,14 @@
 use serde_json::{json,Value};
 use std::{fs,io::{Read,Write},net::TcpListener,path::PathBuf,process::{Command,Output},
  thread,time::{Duration,Instant,SystemTime,UNIX_EPOCH}};
+use std::sync::atomic::{AtomicU64,Ordering};
+static FIXTURE_SEQUENCE:AtomicU64=AtomicU64::new(0);
 const BIN:&str=env!("CARGO_BIN_EXE_cmp");
 fn fixture()->PathBuf {
  let n=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
- let p=std::env::temp_dir().join(format!("cmp-gh-cli-{}-{n}",std::process::id()));
- fs::create_dir_all(&p).unwrap();p
+ let sequence=FIXTURE_SEQUENCE.fetch_add(1,Ordering::Relaxed);
+ let p=std::env::temp_dir().join(format!("cmp-gh-cli-{}-{n}-{sequence}",std::process::id()));
+ fs::create_dir(&p).unwrap();p
 }
 fn run(cwd:&std::path::Path,home:&std::path::Path,args:&[&str])->Output {
  Command::new(BIN).current_dir(cwd).env("CMP_HOME",home)
