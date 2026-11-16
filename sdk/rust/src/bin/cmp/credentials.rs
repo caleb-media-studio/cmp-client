@@ -1,7 +1,11 @@
 //! Cross-platform CMP OAuth refresh credential storage.
 //! OS vault use is always opt-in after the browser authorization callback.
 //! Fallback is an Argon2id-derived XChaCha20-Poly1305 encrypted file.
-use super::{home, private_dir, write_secure_file, Result, SERVICE};
+use super::{home, private_dir, write_secure_file, Result};
+#[cfg(not(target_os = "macos"))]
+use super::SERVICE;
+#[cfg(target_os = "macos")]
+include!("mac_keychain.rs");
 use argon2::Argon2;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chacha20poly1305::{
@@ -55,9 +59,26 @@ fn marker_file() -> Result<PathBuf> {
 fn encrypted_file() -> Result<PathBuf> {
     Ok(vault_dir()?.join("credentials.enc"))
 }
+#[cfg(not(target_os = "macos"))]
 fn entry() -> Result<keyring::Entry> {
     Ok(keyring::Entry::new(SERVICE, "default")?)
 }
+#[cfg(target_os = "macos")]
+fn keychain_get() -> Result<String> { mac_keychain::get() }
+#[cfg(not(target_os = "macos"))]
+fn keychain_get() -> Result<String> { Ok(entry()?.get_password()?) }
+#[cfg(target_os = "macos")]
+fn keychain_set(value: &str) -> Result<()> { mac_keychain::set(value) }
+#[cfg(not(target_os = "macos"))]
+fn keychain_set(value: &str) -> Result<()> { Ok(entry()?.set_password(value)?) }
+#[cfg(target_os = "macos")]
+fn keychain_delete() -> Result<()> { mac_keychain::delete() }
+#[cfg(not(target_os = "macos"))]
+fn keychain_delete() -> Result<()> { Ok(entry()?.delete_credential()?) }
+#[cfg(target_os = "macos")]
+fn keychain_available() -> bool { mac_keychain::available() }
+#[cfg(not(target_os = "macos"))]
+fn keychain_available() -> bool { keychain_get().is_ok() }
 fn passphrase(confirm: bool) -> Result<String> {
     if let Ok(value) = env::var("CMP_CREDENTIAL_PASSPHRASE") {
         if value.len() < 12 {
@@ -157,9 +178,7 @@ pub fn available_status() -> Result<&'static str> {
             "not authenticated"
         }),
         Some(Storage::Keychain) => Ok(
-            if entry()
-                .and_then(|e| e.get_password().map_err(|err| err.into()))
-                .is_ok()
+            if keychain_available()
             {
                 "system credential vault"
             } else {
@@ -175,7 +194,7 @@ fn write_mode(mode: Storage) -> Result<()> {
 pub fn save(token: &str, mode: Storage) -> Result<()> {
     match mode {
         Storage::Keychain => {
-            entry()?.set_password(token)?;
+            keychain_set(token)?;
             write_mode(mode)?;
             if encrypted_file()?.exists() {
                 fs::remove_file(encrypted_file()?)?;
@@ -186,7 +205,7 @@ pub fn save(token: &str, mode: Storage) -> Result<()> {
             let blob = encrypt(token, &pass)?;
             write_secure_file(&encrypted_file()?, &serde_json::to_string(&blob)?, true)?;
             write_mode(mode)?;
-            let _ = entry().and_then(|e| e.delete_credential().map_err(|err| err.into()));
+            let _ = keychain_delete();
         }
         Storage::None => {
             clear()?;
@@ -198,7 +217,7 @@ pub fn save(token: &str, mode: Storage) -> Result<()> {
 pub fn load() -> Result<Credential> {
     match stored_mode()? {
         Some(Storage::Keychain) => Ok(Credential {
-            token: entry()?.get_password().map_err(|_| {
+            token: keychain_get().map_err(|_| {
                 "CMP Cloud is not signed in or system credential vault unavailable. Run cmp login"
             })?,
             storage: Storage::Keychain,
@@ -219,7 +238,7 @@ pub fn load() -> Result<Credential> {
 pub fn rotate(credential: &Credential, next: &str) -> Result<()> {
     match credential.storage {
         Storage::Keychain => {
-            entry()?.set_password(next)?;
+            keychain_set(next)?;
         }
         Storage::EncryptedFile => {
             let pass = credential
@@ -237,7 +256,7 @@ pub fn rotate(credential: &Credential, next: &str) -> Result<()> {
     Ok(())
 }
 pub fn clear() -> Result<()> {
-    let _ = entry().and_then(|e| e.delete_credential().map_err(|err| err.into()));
+    let _ = keychain_delete();
     let file = encrypted_file()?;
     if file.exists() {
         fs::remove_file(file)?;
