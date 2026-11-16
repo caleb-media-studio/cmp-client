@@ -625,12 +625,37 @@ fn doctor(args: &[String]) -> Result<()> {
     let (cfg, path) = load_config()?;
     println!("Configuration: {}", path.display());
     println!("Backend: {} | Server: {}", cfg.backend, cfg.endpoint);
-    if flag(args, "--offline") || cfg.backend == "offline" {
-        println!("Local context store: available (no remote requests).");
-        if cfg.backend == "offline" {
-            println!("Streaming: {}", if cfg.streaming { "enabled" } else { "disabled" });
-            println!("Pending stream operations: {}", cmp_stream::pending()?);
+
+    // --offline means "do not contact a remote server", not "pretend an
+    // embedded store exists" when the selected backend is Cloud or Core HTTP.
+    if flag(args, "--offline") && cfg.backend != "offline" {
+        println!("Remote checks: skipped (--offline). No local context store was checked.");
+        return Ok(());
+    }
+    if cfg.backend == "offline" {
+        let repos = cmp_offline::request(&cfg, "GET", "/v1/repos", None)?;
+        let names = repos["repositories"].as_array()
+            .ok_or("Invalid local CMP repository list")?;
+        println!("Local context store: available (verified; no remote requests).");
+        if let Some(repo) = &cfg.repository {
+            if !names.iter().any(|name| name.as_str() == Some(repo)) {
+                return Err(format!("Local context repository {repo} is missing. Run cmp init").into());
+            }
+            let head_path = format!(
+                "/v1/repos/{}/head?branch={}",
+                url::form_urlencoded::byte_serialize(repo.as_bytes()).collect::<String>(),
+                url::form_urlencoded::byte_serialize(cfg.branch.as_bytes()).collect::<String>()
+            );
+            let head = cmp_offline::request(&cfg, "GET", &head_path, None)?;
+            if head["head"].as_str().is_none_or(str::is_empty) {
+                return Err("Local CMP repository returned no branch head".into());
+            }
+            println!("Selected repository: {repo} (branch {} accessible)", cfg.branch);
+        } else {
+            println!("Selected repository: not bound (run cmp init)");
         }
+        println!("Streaming: {}", if cfg.streaming { "enabled" } else { "disabled" });
+        println!("Pending stream operations: {}", cmp_stream::pending()?);
         return Ok(());
     }
     let caps: Value = if cfg.backend == "local" {
@@ -640,10 +665,50 @@ fn doctor(args: &[String]) -> Result<()> {
             .timeout(Duration::from_secs(8))
             .call()?.into_json()?
     };
+    let advertised = caps["capabilities"].as_object()
+        .ok_or("CMP capability response is malformed: capabilities object missing")?;
+    // Keep doctor aligned with the *documented* CMP Core contract. Optional
+    // Cloud features (WSS, agents, archives) must not be required by Core.
+    for required in [
+        "listRepositories", "getHead", "getSnapshot", "createBranch",
+        "commit", "compareAndSwap", "diff", "merge",
+    ] {
+        if advertised.get(required).and_then(Value::as_bool) != Some(true) {
+            return Err(format!("CMP backend lacks required Core capability: {required}").into());
+        }
+    }
     println!("Protocol capabilities: {}", caps["capabilities"]);
-    match context_request(&cfg, "GET", "/v1/repos", None) {
-        Ok(_) => println!("Authenticated repository API: connected"),
-        Err(e) => println!("Authenticated repository API: unavailable ({e})"),
+
+    // A 401/403 or malformed JSON is NOT a healthy doctor run. In particular,
+    // CI and MCP installation instructions must never treat this as success.
+    let list = match context_request(&cfg, "GET", "/v1/repos", None) {
+        Ok(list) => list,
+        Err(error) => {
+            eprintln!("Authenticated repository API: unavailable ({error})");
+            return Err(error);
+        }
+    };
+    let names = list["repositories"].as_array()
+        .ok_or("Authenticated repository API returned an invalid repository list")?;
+    println!("Authenticated repository API: connected");
+    if let Some(repo) = &cfg.repository {
+        if !names.iter().any(|name| name.as_str() == Some(repo)) {
+            return Err(format!(
+                "Selected repository {repo} is not accessible. Check permissions or run cmp init"
+            ).into());
+        }
+        let head_path = format!(
+            "/v1/repos/{}/head?branch={}",
+            url::form_urlencoded::byte_serialize(repo.as_bytes()).collect::<String>(),
+            url::form_urlencoded::byte_serialize(cfg.branch.as_bytes()).collect::<String>()
+        );
+        let head = context_request(&cfg, "GET", &head_path, None)?;
+        if head["head"].as_str().is_none_or(str::is_empty) {
+            return Err("Selected CMP repository returned no branch head".into());
+        }
+        println!("Selected repository: {repo} (branch {} accessible)", cfg.branch);
+    } else {
+        println!("Selected repository: not bound (run cmp init)");
     }
     Ok(())
 }
