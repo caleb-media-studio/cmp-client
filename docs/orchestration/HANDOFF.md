@@ -5,7 +5,7 @@
 - **Repository:** `caleb-media-studio/cmp-client`
 - **Worktree:** `/home/caleb/Development/cmp/.worktrees/cmp-client-m1-cli-reliability-20261116`
 - **Branch:** `fix/m1-cli-reliability-20261116`
-- **Pull request:** Published from this branch, PR link in GitHub
+- **Pull request:** https://github.com/caleb-media-studio/cmp-client/pull/14 (open, pending Master review)
 
 ## Changed files and verified implementation
 
