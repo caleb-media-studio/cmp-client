@@ -18,7 +18,7 @@ base64 = "0.22"
 keyring = { version = "3.6", default-features = false, features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
 fs2 = "0.4"
 dialoguer = "0.11"
-console = "0.15"
+console = "0.16"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 rpassword = "7"
