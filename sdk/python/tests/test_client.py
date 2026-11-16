@@ -22,5 +22,26 @@ class TestClient(unittest.TestCase):
             with self.assertRaises(CMPError):
                 c.head("demo")
 
+
+    def test_cmp_transport_url_validation(self):
+        from cmp_context import cmp_transport_path
+        self.assertEqual(cmp_transport_path("team/knowledge"), "/team/knowledge.cmp")
+        for candidate in ("team/../bad", "team/repo/extra", "team/..", "/repo"):
+            with self.assertRaises(CMPError):
+                cmp_transport_path(candidate)
+
+    def test_cmp_transport_uses_no_redirect_opener(self):
+        c = CMPClient("https://cloud.cmp.chat", "test-token")
+        fake = MagicMock()
+        fake.open.return_value.__enter__.return_value.read.return_value = (
+            b'{"protocol":"cmp","transportVersion":1}')
+        with patch("cmp_context.build_opener", return_value=fake) as opener:
+            result = c.cmp_manifest("team/knowledge")
+            self.assertEqual(result["protocol"], "cmp")
+            req = fake.open.call_args.args[0]
+            self.assertEqual(req.full_url, "https://cloud.cmp.chat/team/knowledge.cmp")
+            self.assertEqual(req.get_header("Authorization"), "Bearer test-token")
+            self.assertEqual(type(opener.call_args.args[0]).__name__, "_RejectTransportRedirects")
+
 if __name__ == "__main__":
     unittest.main()

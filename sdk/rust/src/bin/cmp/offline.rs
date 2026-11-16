@@ -321,3 +321,37 @@ pub fn request(_cfg: &Config, method: &str, path: &str, body: Option<Value>) -> 
         }
     })
 }
+
+/// Import a remote .cmp snapshot into a brand-new local repository. This is
+/// a snapshot clone, not a transfer of the entire remote commit DAG.
+pub fn import_snapshot(
+    config_dir: &std::path::Path, id: &str, branch: &str, head: &str, records: &[Value],
+) -> Result<()> {
+    validate_repo(id)?;
+    if !valid_branch(branch) || head.len()!=64 || !head.bytes().all(|b|b.is_ascii_hexdigit())
+        || records.len()>100_000 {
+        return Err("Invalid CMP snapshot import metadata".into());
+    }
+    private_dir(config_dir)?;
+    let root=config_dir.join("state");
+    private_dir(&root)?;
+    private_dir(&root.join("repos"))?;
+    let ignore=config_dir.join(".gitignore");
+    if !ignore.exists(){write_secure_file(&ignore,"state/\n",false)?;}
+    let path=repo_path(&root,id)?;
+    if path.exists(){return Err("CMP local repository already exists; refusing to overwrite clone".into());}
+    let mut snapshot=BTreeMap::new();
+    for record in records {
+        let key=validate_record(record)?;
+        if snapshot.insert(key,record.clone()).is_some() {
+            return Err("CMP snapshot contains duplicate record IDs".into());
+        }
+    }
+    let repo=Repository{
+        id:id.into(),
+        branches:BTreeMap::from([(branch.into(),head.into())]),
+        snapshots:BTreeMap::from([(head.into(),snapshot)]),
+        parents:BTreeMap::from([(head.into(),Vec::new())]),
+    };
+    write_repo(&root,&repo)
+}

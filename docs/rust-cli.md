@@ -86,3 +86,34 @@ The companion SDK currently captures encrypted development-agent sessions. CMP C
 The CLI uses atomic configuration writes, refuses symlinked config targets, enforces HTTPS except loopback, requires explicit scope on noninteractive setup, and refuses to replace an existing project config without explicit force. It scans bounded documentation extensions, excludes secrets/generated folders and symlink escapes, and does not upload files without review.
 
 Rust unit tests and MCP protocol smoke tests run via Cargo. Cloud OAuth has independent Firebase emulator and restricted-role PostgreSQL end-to-end coverage. Host-specific installation should also be checked in live Claude Code/Codex/OpenCode versions before marking a platform release stable.
+
+## GitHub CLI-style CMP commands and .cmp transport (v1)
+
+CMP uses familiar nested commands and help categories, but **CMP is versioned context**, not Git source control. CMP does not implement Git clone, Git packfiles, Git checkouts, GitHub issues, or GitHub Actions.
+
+```bash
+cmp --help
+cmp help repo
+cmp repo --help
+cmp auth login
+cmp auth status
+cmp repo create owner/repo --private
+cmp repo list
+cmp repo view owner/repo
+cmp repo view owner/repo --web
+cmp repo clone https://cloud.cmp.chat/owner/repo.cmp
+cmp repo set-default owner/repo
+cmp branch list
+cmp config list
+cmp config get branch
+cmp config set branch feature
+cmp api /v1/repos
+```
+
+The `.cmp` URL is the canonical CMP repository transport identity. The v1 JSON endpoint supports manifest, refs, snapshot and CAS commit operations. SDKs should validate the same origin before using a remote URL. The Rust SDK refuses bearer-token redirects to external hosts.
+
+**Clone is snapshot-only:** it creates a new directory containing `.cmp/config.toml` and a local `.cmp/state` snapshot and records the remote head. It does not create `.git/`, does not rewrite existing files, does not upload anything, does not clone full commit ancestry and **leaves streaming off**. The user can enable remote streaming later through `cmp config set streaming true`; remote-head checks still apply.
+
+The Core reference server uses `/local/repo.cmp` for its flat, development-only namespace, while CMP Cloud uses `/owner/repo.cmp`. The proprietary Cloud edition requires its matching route to be deployed. A returned 404 before Cloud deployment is not proof the repository is missing.
+
+Non-CMP GitHub commands, including issue, pull request, Codespaces, workflow, release, and GitHub organization management, are not aliases for CMP repository operations and are intentionally not advertised as supported until Cloud services exist.
