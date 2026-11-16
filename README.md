@@ -1,8 +1,17 @@
 # CMP Client
 
+## Public source versus proprietary CMP Cloud
+
+The Core protocol, self-hosted Core server, and CMP client SDKs are
+Apache-2.0 licensed. **CMP Connect, managed authentication, WebSocket
+streaming, agent coordination, and session archives are proprietary CMP Cloud
+services, not part of the self-hosted server.** The CMP Web source repository
+is private. See [Public vs. proprietary](docs/public-vs-proprietary.md),
+[LICENSE](LICENSE), and [Security](SECURITY.md).
+
+
 Public-source client SDKs and CLI for the **Context Management Protocol**.
-This is an audited clean-history repository candidate, still private until
-the release audit is finished.
+This codebase is public-source, in pre-alpha, and not a published package.
 
 CMP Client supports both:
 - CMP Core: versioned repositories, record snapshots, commits, branches and

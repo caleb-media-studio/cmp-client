@@ -1,6 +1,6 @@
 # CMP Client: Core and optional Cloud API contracts
 
-Source status: Clean-history release candidate, still private.
+Source status: Public pre-alpha client, clean Git history.
 
 The public CMP Client implements the Core HTTP repository operations for
 both self-hosted CMP Server and CMP Cloud.
