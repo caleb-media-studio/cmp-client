@@ -456,6 +456,29 @@ fn open_url(url: &str) -> bool {
     };
     cmd.spawn().is_ok()
 }
+fn choose_credential_storage(args: &[String], interactive: bool) -> Result<cmp_credentials::Storage> {
+    // An OAuth grant is not useful if the next CLI invocation cannot load it.
+    // In non-TTY agent/terminal sessions, default to the OS credential vault
+    // instead of silently discarding and revoking the refresh token.
+    let chosen = match argument(args, "--credential-store") {
+        Some(value) => value,
+        None if !interactive => "keychain".into(),
+        None if cmp_tui::confirm("Save CMP Cloud login in the system keychain?", true)? => {
+            "keychain".into()
+        }
+        None if cmp_tui::confirm("Save credentials in an encrypted CMP file instead?", true)? => {
+            "encrypted".into()
+        }
+        None => "none".into(),
+    };
+    match chosen.as_str() {
+        "keychain" => Ok(cmp_credentials::Storage::Keychain),
+        "encrypted" => Ok(cmp_credentials::Storage::EncryptedFile),
+        "none" => Ok(cmp_credentials::Storage::None),
+        _ => Err("Credential store must be keychain, encrypted, or none".into()),
+    }
+}
+
 fn login(args: &[String]) -> Result<()> {
     // Use the same effective configuration as repo commands, including
     // CMP_CONFIG and environment overrides. A missing config is allowed so
@@ -569,19 +592,7 @@ fn login(args: &[String]) -> Result<()> {
     let refresh = token["refresh_token"]
         .as_str()
         .ok_or("No refresh token returned by CMP Cloud")?;
-    let chosen = match argument(args, "--credential-store") {
-        Some(value) => value,
-        None if !io::stdin().is_terminal() => "none".into(),
-        None if cmp_tui::confirm("Would you like to save in keychain?", true)? => "keychain".into(),
-        None if cmp_tui::confirm("Save credentials in an encrypted CMP file instead?", true)? => "encrypted".into(),
-        None => "none".into(),
-    };
-    let mode = match chosen.as_str() {
-        "keychain" => cmp_credentials::Storage::Keychain,
-        "encrypted" => cmp_credentials::Storage::EncryptedFile,
-        "none" => cmp_credentials::Storage::None,
-        _ => return Err("Credential store must be keychain, encrypted, or none".into()),
-    };
+    let mode = choose_credential_storage(args, io::stdin().is_terminal())?;
     if let Err(error) = cmp_credentials::save(refresh, mode) {
         if mode == cmp_credentials::Storage::Keychain && io::stdin().is_terminal()
             && cmp_tui::confirm("Keychain unavailable. Save in an encrypted CMP file instead?", true)? {
@@ -1283,6 +1294,26 @@ mod tests {
             Some(root.join("src/.cmp/config.toml"))
         );
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn oauth_noninteractive_login_keeps_refresh_credentials_by_default() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            choose_credential_storage(&empty, false).unwrap(),
+            cmp_credentials::Storage::Keychain
+        );
+        let explicitly_encrypted = vec!["--credential-store".into(), "encrypted".into()];
+        assert_eq!(
+            choose_credential_storage(&explicitly_encrypted, false).unwrap(),
+            cmp_credentials::Storage::EncryptedFile
+        );
+        let explicitly_ephemeral = vec!["--credential-store".into(), "none".into()];
+        assert_eq!(
+            choose_credential_storage(&explicitly_ephemeral, false).unwrap(),
+            cmp_credentials::Storage::None
+        );
+        let bad = vec!["--credential-store".into(), "plaintext".into()];
+        assert!(choose_credential_storage(&bad, false).is_err());
     }
     #[test]
     fn repo_identifier_validation() {

@@ -224,8 +224,8 @@ pub fn save(token: &str, mode: Storage) -> Result<()> {
 pub fn load() -> Result<Credential> {
     match stored_mode()? {
         Some(Storage::Keychain) => Ok(Credential {
-            token: keychain_get().map_err(|_| {
-                "CMP Cloud is not signed in or system credential vault unavailable. Run cmp login"
+            token: keychain_get().map_err(|error| {
+                format!("CMP Cloud Keychain credential could not be read: {error}. If it is an access-permission prompt, check Keychain Access before signing in again.")
             })?,
             storage: Storage::Keychain,
             passphrase: None,
