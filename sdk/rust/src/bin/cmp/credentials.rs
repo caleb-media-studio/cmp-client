@@ -153,6 +153,14 @@ fn decrypt(file: &Envelope, pass: &str) -> Result<String> {
         .map_err(|_| "Incorrect CMP passphrase or damaged encrypted credentials")?;
     Ok(String::from_utf8(raw)?)
 }
+fn save_encrypted_at(file: &std::path::Path, token: &str, pass: &str) -> Result<()> {
+    let blob = encrypt(token, pass)?;
+    write_secure_file(file, &serde_json::to_string(&blob)?, true)
+}
+fn load_encrypted_at(file: &std::path::Path, pass: &str) -> Result<String> {
+    let blob: Envelope = serde_json::from_slice(&fs::read(file)?)?;
+    decrypt(&blob, pass)
+}
 pub fn stored_mode() -> Result<Option<Storage>> {
     let marker = marker_file()?;
     if marker.is_file() {
@@ -202,8 +210,7 @@ pub fn save(token: &str, mode: Storage) -> Result<()> {
         }
         Storage::EncryptedFile => {
             let pass = passphrase(true)?;
-            let blob = encrypt(token, &pass)?;
-            write_secure_file(&encrypted_file()?, &serde_json::to_string(&blob)?, true)?;
+            save_encrypted_at(&encrypted_file()?, token, &pass)?;
             write_mode(mode)?;
             let _ = keychain_delete();
         }
@@ -225,9 +232,8 @@ pub fn load() -> Result<Credential> {
         }),
         Some(Storage::EncryptedFile) => {
             let pass = passphrase(false)?;
-            let blob: Envelope = serde_json::from_slice(&fs::read(encrypted_file()?)?)?;
             Ok(Credential {
-                token: decrypt(&blob, &pass)?,
+                token: load_encrypted_at(&encrypted_file()?, &pass)?,
                 storage: Storage::EncryptedFile,
                 passphrase: Some(pass),
             })
@@ -245,11 +251,7 @@ pub fn rotate(credential: &Credential, next: &str) -> Result<()> {
                 .passphrase
                 .as_ref()
                 .ok_or("Missing CMP credential decryption passphrase")?;
-            write_secure_file(
-                &encrypted_file()?,
-                &serde_json::to_string(&encrypt(next, pass)?)?,
-                true,
-            )?;
+            save_encrypted_at(&encrypted_file()?, next, pass)?;
         }
         Storage::None => return Err("Cannot rotate unsaved CMP credentials".into()),
     }
@@ -270,6 +272,67 @@ pub fn clear() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn encrypted_file_persistence_rotation_and_tamper_fail_closed() {
+        use rand::{rngs::OsRng, RngCore};
+        let mut entropy = [0u8; 12];
+        OsRng.fill_bytes(&mut entropy);
+        let name: String = entropy.iter().map(|byte| format!("{byte:02x}")).collect();
+        let directory = std::env::temp_dir().join(format!("cmp-credential-fixture-{name}"));
+        std::fs::create_dir(&directory).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        let file = directory.join("credentials.enc");
+        let pass = "credential file roundtrip passphrase of sufficient length";
+
+        save_encrypted_at(&file, "refresh-old-local-fixture", pass).unwrap();
+        let before = std::fs::read_to_string(&file).unwrap();
+        assert!(!before.contains("refresh-old-local-fixture"));
+        assert!(!before.contains(pass));
+        assert_eq!(load_encrypted_at(&file, pass).unwrap(), "refresh-old-local-fixture");
+        assert!(load_encrypted_at(&file, "a completely incorrect passphrase").is_err());
+
+        save_encrypted_at(&file, "refresh-rotated-local-fixture", pass).unwrap();
+        let after = std::fs::read_to_string(&file).unwrap();
+        assert_ne!(before, after);
+        assert!(!after.contains("refresh-old-local-fixture"));
+        assert!(!after.contains("refresh-rotated-local-fixture"));
+        assert_eq!(load_encrypted_at(&file, pass).unwrap(), "refresh-rotated-local-fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let mut envelope: Envelope = serde_json::from_str(&after).unwrap();
+        envelope.ciphertext = STANDARD.encode(b"corrupted local test ciphertext");
+        std::fs::write(&file, serde_json::to_string(&envelope).unwrap()).unwrap();
+        assert!(load_encrypted_at(&file, pass).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn encrypted_file_rejects_symlink_without_overwriting_target() {
+        use std::os::unix::fs::symlink;
+        let mut entropy=[0u8;12];
+        OsRng.fill_bytes(&mut entropy);
+        let id: String = entropy.iter().map(|byte| format!("{byte:02x}")).collect();
+        let directory=std::env::temp_dir().join(format!("cmp-credential-symlink-{id}"));
+        fs::create_dir(&directory).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _=fs::remove_dir_all(&self.0); }
+        }
+        let _cleanup=Cleanup(directory.clone());
+        let victim=directory.join("victim.txt");
+        fs::write(&victim,"unchanged").unwrap();
+        let link=directory.join("credentials.enc");
+        symlink(&victim,&link).unwrap();
+        assert!(save_encrypted_at(&link,"must-not-appear","safe credential passphrase").is_err());
+        assert_eq!(fs::read_to_string(&victim).unwrap(),"unchanged");
+    }
     #[test]
     fn encrypted_store_roundtrip_and_tamper_detection() {
         let pass = "an adequately long local test password";

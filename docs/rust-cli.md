@@ -141,3 +141,29 @@ The public client Core test runner supports independent engineer worktrees:
 When unset, it retains its previous sibling-server path. Build the reference
 Core server separately, and do not use production CMP Cloud credentials in this
 test.
+## Encrypted fallback and streaming opt-in validation (M1 issue #15)
+
+The file fallback is covered by on-disk tests for Argon2id and
+XChaCha20-Poly1305 encryption, refresh-token rotation, wrong passphrases,
+tampered ciphertext, atomic restricted-mode files (0600 on Unix) and symlink
+refusal. These tests use disposable paths and never touch your account
+credentials or system Keychain items. The existing macOS Keychain adapter has
+its own disposable-item tests, but interactive Always Allow behavior depends
+on the user's macOS session and cannot be certified by Linux CI.
+
+Turning `cmp config set streaming false` off preserves previously queued
+outbox events without enqueueing subsequent offline context changes. Turning
+it back on does not silently flush the queue; use `cmp stream push` to
+retry after checking the destination and repository revision. No retroactive
+backfill is promised for context created while streaming was disabled.
+
+**Canonical repository identity:** all client-facing repos will use
+`owner/name`. Self-hosted Core and embedded offline use `local/name`;
+Cloud uses actual owner namespaces. Core's SQLite keys can remain flat, but
+Core must implement its approved API mapping separately. Existing offline
+user namespaces are not silently rewritten by this client-only test PR.
+
+**Dependencies before full M1 integration signoff:** the Core server must
+implement `local/name` REST canonicalization, and Backend + Security must
+provide a disposable OAuth/Firebase/PostgreSQL Cloud tenant fixture. These
+integration tests must not be run with customer tokens or production SQL.
