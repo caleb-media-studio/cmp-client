@@ -1,6 +1,6 @@
 {
   "standardRepo": "caleb-media-studio/cmp-protocol",
-  "standardCommit": "fbe3a4a385173d55271aa5446348739aa2163fc0",
+  "standardCommit": "b2f6a600c22ca68b76154883570cc8bae7a97cfb",
   "package": "@cmp-chat/protocol",
   "files": {
     "package.json": "c61019e5e27b9848c5046b50f5e3f00e75530b299f6b46f73c7ce1130d8dc782",
