@@ -11,6 +11,9 @@ mod cmp_offline;
 mod cmp_credentials;
 #[path = "cmp/stream.rs"]
 mod cmp_stream;
+#[cfg(feature = "cloud-fixture-tests")]
+#[path = "cmp/cloud_fixture.rs"]
+mod cmp_cloud_fixture;
 #[path = "cmp/gh.rs"]
 mod cmp_gh;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -126,6 +129,25 @@ fn load_config() -> Result<(Config, PathBuf)> {
     if let Ok(repo) = env::var("CMP_REPOSITORY") {
         validate_repo(&repo)?;
         cfg.repository = Some(repo);
+    }
+    // Fail closed at config loading, BEFORE any public capabilities HTTP GET.
+    // Merely checking in auth_token is too late: doctor makes a public
+    // capabilities request first. A production CLI must never probe an
+    // arbitrary Cloud origin while assuming the official Cloud identity.
+    if cfg.backend == "cloud" && cfg.endpoint != CLOUD {
+        #[cfg(feature = "cloud-fixture-tests")]
+        {
+            if !cmp_cloud_fixture::authorized(&cfg)? {
+                return Err("Delegated CMP Cloud OAuth currently supports only cloud.cmp.chat".into());
+            }
+        }
+        #[cfg(not(feature = "cloud-fixture-tests"))]
+        return Err("Delegated CMP Cloud OAuth currently supports only cloud.cmp.chat".into());
+    }
+    #[cfg(feature = "cloud-fixture-tests")]
+    if env::var("CMP_CLOUD_FIXTURE_MODE").as_deref() == Ok("1") {
+        // A feature-gated test binary still must not contact Cloud production.
+        cmp_cloud_fixture::authorized(&cfg)?;
     }
     Ok((cfg, source))
 }
@@ -318,6 +340,10 @@ fn setup(args: &[String]) -> Result<()> {
         None => prompt("CMP server endpoint", fallback)?,
     };
     let endpoint = normalize_endpoint(&endpoint)?;
+    #[cfg(feature = "cloud-fixture-tests")]
+    if env::var("CMP_CLOUD_FIXTURE_MODE").as_deref() == Ok("1") {
+        cmp_cloud_fixture::authorized(&Config::new(&backend, &endpoint))?;
+    }
     let dest = scope_path(&scope)?;
     let mut cfg = Config::new(&backend, &endpoint);
     if flag(args, "--streaming") && flag(args, "--no-streaming") {
@@ -388,11 +414,17 @@ fn context_request(cfg: &Config, method: &str, path: &str, body: Option<Value>) 
     }
 }
 fn auth_token(cfg: &Config) -> Result<String> {
-    if cfg.backend == "local" || (cfg.backend == "offline" && cfg.endpoint != CLOUD) {
+    // This compile-time-only Cloud fixture path is NEVER present in the
+    // normal CLI build and cannot address external/production hosts.
+    #[cfg(feature = "cloud-fixture-tests")]
+    let local_cloud_fixture = cmp_cloud_fixture::authorized(cfg)?;
+    #[cfg(not(feature = "cloud-fixture-tests"))]
+    let local_cloud_fixture = false;
+    if cfg.backend == "local" || (cfg.backend == "offline" && cfg.endpoint != CLOUD && !local_cloud_fixture) {
         return env::var("CMP_DEV_TOKEN")
             .map_err(|_| "Local CMP server requires CMP_DEV_TOKEN".into());
     }
-    if cfg.endpoint != CLOUD {
+    if cfg.endpoint != CLOUD && !local_cloud_fixture {
         return Err("Delegated CMP Cloud OAuth currently supports only cloud.cmp.chat".into());
     }
     let root = home()?.join(".cmp");
@@ -621,6 +653,17 @@ fn logout() -> Result<()> {
     Ok(())
 }
 
+fn required_doctor_capabilities(backend: &str) -> &'static [&'static str] {
+    if backend == "cloud" {
+        // Cloud runtime writes are optional. Diagnostics must still verify
+        // real authorized repository list and selected branch access.
+        &["listRepositories", "getHead", "getSnapshot", "diff"]
+    } else {
+        &["listRepositories", "getHead", "getSnapshot", "createBranch",
+          "commit", "compareAndSwap", "diff", "merge"]
+    }
+}
+
 fn doctor(args: &[String]) -> Result<()> {
     let (cfg, path) = load_config()?;
     println!("Configuration: {}", path.display());
@@ -667,17 +710,20 @@ fn doctor(args: &[String]) -> Result<()> {
     };
     let advertised = caps["capabilities"].as_object()
         .ok_or("CMP capability response is malformed: capabilities object missing")?;
-    // Keep doctor aligned with the *documented* CMP Core contract. Optional
-    // Cloud features (WSS, agents, archives) must not be required by Core.
-    for required in [
-        "listRepositories", "getHead", "getSnapshot", "createBranch",
-        "commit", "compareAndSwap", "diff", "merge",
-    ] {
-        if advertised.get(required).and_then(Value::as_bool) != Some(true) {
-            return Err(format!("CMP backend lacks required Core capability: {required}").into());
+    // Doctor is a *read/access* diagnostic for CMP Cloud. Global write
+    // features may be unavailable in a read-only deployment and must never
+    // turn an otherwise authorized read-only Cloud session into a false error.
+    // Self-hosted Core still requires the full advertised Core contract.
+    for feature in required_doctor_capabilities(&cfg.backend) {
+        if advertised.get(*feature).and_then(Value::as_bool) != Some(true) {
+            return Err(format!("CMP backend lacks required Core capability: {feature}").into());
         }
     }
     println!("Protocol capabilities: {}", caps["capabilities"]);
+    if cfg.backend == "cloud" && ["createBranch", "commit", "merge"].iter().any(|feature|
+        advertised.get(*feature).and_then(Value::as_bool) != Some(true)) {
+        println!("Cloud write capabilities: unavailable (read-only runtime); repository access will still be checked");
+    }
 
     // A 401/403 or malformed JSON is NOT a healthy doctor run. In particular,
     // CI and MCP installation instructions must never treat this as success.
@@ -980,6 +1026,16 @@ fn find_docs(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(results)
 }
 fn command(args: Vec<String>) -> Result<()> {
+    #[cfg(feature = "cloud-fixture-tests")]
+    if env::var("CMP_CLOUD_FIXTURE_MODE").as_deref() == Ok("1")
+        && args.first().is_some_and(|name| !matches!(
+            name.as_str(),
+            "setup"|"fixture"|"init"|"int"|"doctor"|"repo"|"status"|
+            "config"|"api"|"head"|"snapshot"|"branch"|"commit"|
+            "diff"|"merge"|"stream"
+        )) {
+        return Err("Cloud fixture mode disallows browser login and unrelated commands".into());
+    }
     // Match gh: nested --help never needs a configured server or token.
     if args.len()>1 && args.iter().skip(1).any(|v| v=="--help"||v=="-h")
         && matches!(args[0].as_str(),"repo"|"auth"|"config"|"branch"|"api") {
@@ -997,6 +1053,10 @@ fn command(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         "setup" => setup(&args[1..]),
+        #[cfg(feature = "cloud-fixture-tests")]
+        "fixture" if args.get(1).is_some_and(|s| s == "seed-refresh") => {
+            cmp_cloud_fixture::seed_refresh()
+        },
         "login" => login(&args[1..]),
         "stream" if args.get(1).is_some_and(|x| x == "push") => {
             let (cfg, _) = load_config()?;
@@ -1283,6 +1343,20 @@ mod tests {
             Some(root.join("src/.cmp/config.toml"))
         );
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn cloud_doctor_does_not_require_global_write_capabilities() {
+        let cloud = required_doctor_capabilities("cloud");
+        assert!(cloud.contains(&"listRepositories"));
+        assert!(cloud.contains(&"getHead"));
+        assert!(!cloud.contains(&"commit"));
+        assert!(!cloud.contains(&"merge"));
+        assert!(!cloud.contains(&"createBranch"));
+        let core = required_doctor_capabilities("local");
+        assert!(core.contains(&"commit"));
+        assert!(core.contains(&"merge"));
+        assert!(core.contains(&"createBranch"));
+        assert!(core.contains(&"compareAndSwap"));
     }
     #[test]
     fn repo_identifier_validation() {
