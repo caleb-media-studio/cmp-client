@@ -5,7 +5,7 @@
 - **Repository:** `caleb-media-studio/cmp-client`
 - **Worktree:** `/home/caleb/Development/cmp/.worktrees/cmp-client-m1-integration-20261116`
 - **Branch:** `test/m1-cli-core-cloud-credentials-20261116`
-- **PR:** Published separately for Master review. Do not auto-merge or deploy.
+- **PR:** https://github.com/caleb-media-studio/cmp-client/pull/16 (open; Master review required)
 
 ## Verified in this client-only checkpoint
 
@@ -34,9 +34,8 @@
 - `CMP_CORE_SERVER_MODULE=<previously-built-Core> pnpm verify:local`:
   PASS for the existing Core HTTP behavior, not canonical namespace
   interoperability.
-- **Not tested:** authenticated Cloud production, cross-tenant/revoked-member
-  Cloud fixture, current macOS Keychain Always Allow interactive prompt,
-  Windows credential manager, canonical Core `local/name` REST adapter.
+- Native **macOS** `cargo test --locked --bin cmp --tests`: **46 passed**, including a uniquely named disposable Keychain roundtrip, encrypted-file tests, offline streaming, and the corrected doctor HTTP mock fixture.
+- **Not tested:** authenticated Cloud tenant fixture, visual macOS Always Allow persistence through app identity changes, Windows Credential Manager, canonical Core `local/name` REST adapter.
 
 ## Compatibility matrix
 
@@ -45,7 +44,7 @@
 | Offline embedded persistence, branches and CAS | Existing tests PASS |
 | Opt-in offline streaming, retry/conflict, disable | PASS, new disabled-mode test |
 | Encrypted credential fallback on disk | PASS, new isolated tests |
-| macOS stable Keychain helper | Existing disposable test; not rerun in this Linux checkpoint |
+| macOS stable Keychain helper | PASS on native Mac, disposable add/read/rotate/delete; UI Always Allow prompt not certified |
 | Core flat-ID REST SDK operations | PASS against current built Core |
 | Core canonical `local/name` REST | BLOCKED on cmp-server issue #5 |
 | Cloud OAuth, revocation and least-privilege reads | BLOCKED on Cloud fixture |
