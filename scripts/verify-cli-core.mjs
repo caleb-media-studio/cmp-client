@@ -65,6 +65,11 @@ const setup=async(cwd,repo)=>cmp(cwd,[
 const firstStore=new Store(db);
 const seeded=firstStore.create("legacy_repo");
 const original=seeded.head();
+// A legacy pre-canonical event must stay flat in SQLite yet be canonical
+// through the public CLI/API response, including after server restarts.
+firstStore.mutate("legacy_repo",r=>r.branch("historical"),"branch.created");
+const historicalCursor=firstStore.eventsAfter("legacy_repo")[0].cursor;
+assert.equal(firstStore.eventsAfter("legacy_repo")[0].params.repo,"legacy_repo");
 firstStore.close();
 process.env.CMP_ENV="development";
 try{
@@ -79,6 +84,15 @@ try{
  assert.match(doctor,/Authenticated repository API: connected/);
  assert.match(doctor,/Selected repository: local\/legacy_repo/);
  assert.deepEqual(parseJson(await cmp(legacy,["repo","list"])).repositories,["local/legacy_repo"]);
+const historicalEvents=parseJson(await cmp(legacy,[
+ "api","/v1/repos/local%2Flegacy_repo/events"
+])).events;
+assert.equal(historicalEvents.length,1);
+assert.equal(historicalEvents[0].params.repo,"local/legacy_repo");
+assert.equal(historicalEvents[0].cursor,historicalCursor);
+assert.deepEqual(parseJson(await cmp(legacy,[
+ "api","/v1/repos/legacy_repo/events"
+])).events,historicalEvents);
  assert.match(await cmp(legacy,["repo","view"]),/local\/legacy_repo.cmp/);
  assert.equal((await cmp(legacy,["config","get","streaming"])).trim(),"false");
  const invalid=await cmp(legacy,["repo","create","other/forbidden"],{shouldFail:true});
@@ -122,6 +136,14 @@ try{
  assert.equal(merged.parents.length,2);
  assert.equal(parseJson(await cmp(fresh,["snapshot"])).records.length,2);
  assert.equal(parseJson(await cmp(fresh,["diff",before,"main"])).changes.length,2);
+const newlyCreatedEvents=parseJson(await cmp(fresh,[
+ "api","/v1/repos/local%2Fnew_repo/events"
+])).events;
+assert(newlyCreatedEvents.length>=3);
+assert(newlyCreatedEvents.every(event=>event.params.repo==="local/new_repo"));
+assert.deepEqual(parseJson(await cmp(fresh,[
+ "api","/v1/repos/new_repo/events"
+])).events,newlyCreatedEvents);
  // Exact .cmp JSON transport identity and snapshot fetched from real Core.
  let resp=await api("/local/new_repo.cmp");
  assert.equal(resp.status,200);
@@ -146,14 +168,22 @@ try{
  await app.close();app=undefined;
  const flat=new Store(db);
  assert.deepEqual(flat.list().slice().sort(),["created_by_init","legacy_repo","new_repo"].sort());
- flat.close();
+assert.equal(flat.eventsAfter("legacy_repo")[0].params.repo,"legacy_repo");
+assert(flat.eventsAfter("new_repo").every(event=>event.params.repo==="new_repo"));
+flat.close();
  app=createCMPServer({token,dbFile:db,host:"127.0.0.1",port});
  port=(await app.listen()).port;
  assert.match(await cmp(fresh,["doctor"]),/Authenticated repository API: connected/);
  assert.equal(parseJson(await cmp(fresh,["head"])).head,merged.id);
  assert.equal(parseJson(await cmp(fresh,["snapshot"])).records.length,2);
- assert.equal((await (await api("/local/legacy_repo.cmp")).json()).repository,"local/legacy_repo");
- console.log("PASS native CMP CLI against real Core server and persisted SQLite: init, create/list/doctor, branches/commit/snapshot/diff/merge/CAS, legacy keys, .cmp, clone, restart and authentication denial");
+assert.equal(parseJson(await cmp(legacy,[
+ "api","/v1/repos/local%2Flegacy_repo/events?cursor=0"
+])).events[0].params.repo,"local/legacy_repo");
+assert.deepEqual(parseJson(await cmp(fresh,[
+ "api","/v1/repos/local%2Fnew_repo/events"
+])).events,newlyCreatedEvents);
+assert.equal((await (await api("/local/legacy_repo.cmp")).json()).repository,"local/legacy_repo");
+ console.log("PASS native CMP CLI against real Core server and persisted SQLite: init, create/list/doctor, branches/commit/snapshot/diff/merge/CAS, historical/new canonical event payloads, legacy flat SQLite keys, .cmp, clone, restart and authentication denial");
 } finally {
  if(app)await app.close();
  rmSync(dir,{recursive:true,force:true});

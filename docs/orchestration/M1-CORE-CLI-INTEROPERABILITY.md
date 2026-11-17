@@ -6,9 +6,9 @@
 
 ## Source branches
 
-- Protocol `feat/m1-canonical-local-20261116`, commit `fbe3a4a385173d55271aa5446348739aa2163fc0`, PR #6
-- Core `feat/m1-canonical-local-20261116`, commit `12e14758fdae182578eda95a30cc04c3c0f6ba66`, PR #6
-- Client `feat/m1-canonical-local-20261116`, dedicated client PR opened after native test verification
+- Protocol `feat/m1-canonical-local-20261116`, current head `4bea03123a1699ed502c351f1ab7c8c812292ed9`, PR #6 (documentation-only fix over `fbe3a4a`)
+- Core `feat/m1-canonical-local-20261116`, current head `357bb1d5065f9ba34aa80d47af89b3822fa602f2`, PR #6 (event response identity regression fix)
+- Client `feat/m1-canonical-local-20261116`, PR #17; native event regression added as review follow-up
 
 ## Implementation
 
@@ -20,7 +20,9 @@
    SQLite repositories, commit ancestry and event logs retain original flat
    `name` keys. Existing flat HTTP/RPC requests are deprecated local-only aliases.
    Raw encoded traversal, wrong namespace and double-encoded route segments are
-   rejected before they can redirect a repository lookup. Production safety
+   rejected before they can redirect a repository lookup. Historical and new
+   event envelopes return canonical `params.repo: local/name` at the HTTP
+   response boundary, without rewriting flat event payloads or cursor IDs. Production safety
    gates stay unchanged: `CMP_ENV=development`, loopback-only binding, a
    bearer token of at least 32 chars and no public production deployment.
 3. **Client:** native CLI and TypeScript SDK talk to actual Core over loopback.
@@ -36,9 +38,10 @@
 
 - Protocol `pnpm test && pnpm build`: six TypeScript tests, schema/fixture
   conformance and build passed.
-- Core `pnpm test`: 14/14 tests passed, including SQLite legacy repository
+- Core `pnpm test`: 15/15 tests passed, including SQLite legacy repository
   persistence, canonical route/RPC, invalid owner, malformed path, raw HTTP
-  traversal, CAS and standalone compiled process restart.
+  traversal, CAS, standalone compiled process restart and historical/new event
+  canonicalization with unchanged stored SQLite rows, cursor and event IDs.
 - Rust CLI and SDK `cargo test --locked --bin cmp --tests`: 44/44 passed;
   strict Clippy with `-D warnings`: pass.
 - Client `pnpm build`, `pnpm test`, `pnpm protocol:check`: passed,
@@ -47,6 +50,9 @@
   existing and `--create`, `cmp repo list/create/view/clone`, `cmp doctor`,
   head, branches, commits, snapshots, diffs, merge, stale CAS 409, auth 401,
   `.cmp` identity and snapshot, historical flat storage and restart.
+  The real compiled CLI's `cmp api` also verifies historical and new event
+  envelopes emit canonical `params.repo:local/name`, while flat aliases return
+  identical events and the persisted SQLite payloads remain flat.
 - TypeScript `CMP_CORE_SERVER_MODULE=... pnpm verify:local`: PASS on actual
   Core feature build, including canonical repository listing, metadata and
   TypeScript SDK `.cmp` manifest/refs/snapshot. Other JS tests and protocol
@@ -90,9 +96,12 @@ The test uses only a newly created local development bearer token.
 - Legacy flat aliases are intentionally supported **only** by self-hosted
   Core, and canonical names are always returned by new public responses.
 - The `.cmp` URL is CMP JSON context repository transport, not Git HTTP.
-- Client's protocol mirror points at Protocol PR #6 commit until Master
-  merges it. After squash merge, confirm the mirror's hashes against the
-  merged Protocol `main` commit and update the pin if needed.
+- Client's protocol mirror remains pinned to Protocol's source contract commit
+  `fbe3a4a` (the follow-up `4bea031` only fixes docs; protocol TypeScript file
+  hashes are unchanged). This is intentionally not yet the Protocol main SHA.
+  After Master squash-merges Protocol #6, sync the mirror from the **actual**
+  merged `cmp-protocol/main`, confirm hashes and record that squash SHA in
+  `protocol-snapshot.json`. Do not fabricate the eventual merged commit.
 - This does **not** authorize a Core production launch or assume Cloud OAuth
   is compatible with the local development token.
 
