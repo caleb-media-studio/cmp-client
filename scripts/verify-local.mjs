@@ -23,9 +23,14 @@ try{
  assert.equal(capabilities.capabilities.websocket,false);
  assert.equal(capabilities.capabilities.agentCoordination,false);
  assert.equal(capabilities.capabilities.sessionArchive,false);
- const created=await client.createRepository("core-test");
+ assert.equal(capabilities.repositoryIdentifier,"owner/name");
+ assert.equal(capabilities.repositoryNamespace,"local");
+ const created=await client.createRepository("local/core-test");
  assert.ok(created.head);
- const updated=await client.commit("core-test",{
+ assert.equal(created.id,"local/core-test");
+ assert.deepEqual((await client.listRepositories()).repositories,["local/core-test"]);
+ await assert.rejects(client.createRepository("other/forbidden"));
+ const updated=await client.commit("local/core-test",{
   branch:"main",expectedHead:created.head,authorId:"agent",
   message:"Core record",changes:[{op:"put",record:{
    id:"record1",kind:"fact",content:"Persistent knowledge",
@@ -34,14 +39,19 @@ try{
   }}]
  });
  assert.ok(updated.id);
- const records=await client.getSnapshot("core-test");
+ const records=await client.getSnapshot("local/core-test");
  assert.equal(records.records.length,1);
- const branch=await client.createBranch("core-test","feature");
+ const branch=await client.createBranch("local/core-test","feature");
  assert.equal(branch.head,updated.id);
- const diff=await client.diff("core-test",created.head,"main");
+ const manifest=await client.cmpManifest("local/core-test");
+ assert.equal(manifest.repository,"local/core-test");
+ assert.equal(manifest.head,updated.id);
+ assert.equal((await client.cmpRefs("local/core-test")).branches.feature,updated.id);
+ assert.equal((await client.cmpSnapshot("local/core-test")).records.length,1);
+ const diff=await client.diff("local/core-test",created.head,"main");
  assert.equal(diff.changes.length,1);
  await assert.rejects(client.joinAgent({
-  organizationId:"company",repositoryId:"core-test",agentId:"example",
+  organizationId:"company",repositoryId:"local/core-test",agentId:"example",
   sourceRepository:{provider:"git",repositoryId:"a"}
  }),e=>e instanceof UnsupportedCMPCapability&&e.capability==="agentCoordination");
  await assert.rejects(client.connect(),
