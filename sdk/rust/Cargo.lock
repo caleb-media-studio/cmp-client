@@ -343,7 +343,7 @@ dependencies = [
  "fs2",
  "keyring",
  "percent-encoding",
- "rand 0.8.8",
+ "rand 0.9.5",
  "rpassword",
  "serde",
  "serde_json",
