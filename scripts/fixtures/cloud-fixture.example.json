@@ -1,0 +1,16 @@
+{
+  "fixtureVersion": 1,
+  "kind": "firebase-auth-emulator-postgresql",
+  "firebaseProjectId": "cmp-sdk-e2e",
+  "origin": "http://127.0.0.1:48123",
+  "disposable": true,
+  "realCloudHttp": true,
+  "repositories": {
+    "ownerWritable": "test-alpha/owner-writable",
+    "readerReadable": "test-alpha/reader-readable",
+    "outsiderPrivate": "test-beta/private-repository",
+    "revocableMember": "test-alpha/revocable-member",
+    "streamWritable": "test-alpha/stream-empty",
+    "revocableGrant": "test-alpha/revocable-grant"
+  }
+}

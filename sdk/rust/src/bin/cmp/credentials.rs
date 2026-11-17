@@ -221,6 +221,15 @@ pub fn save(token: &str, mode: Storage) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(feature = "cloud-fixture-tests")]
+pub fn seed_fixture_encrypted(token: &str) -> Result<()> {
+    let pass = passphrase(true)?;
+    save_encrypted_at(&encrypted_file()?, token, &pass)?;
+    write_mode(Storage::EncryptedFile)?;
+    // Unlike ordinary user login, this never accesses the system Keychain.
+    Ok(())
+}
+
 pub fn load() -> Result<Credential> {
     match stored_mode()? {
         Some(Storage::Keychain) => Ok(Credential {
