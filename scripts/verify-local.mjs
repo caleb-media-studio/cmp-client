@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
-import {createCMPServer} from "../../cmp-server/dist/server.js";
+import {resolve} from "node:path";
+import {pathToFileURL} from "node:url";
 import {CMPClient,UnsupportedCMPCapability} from "../packages/sdk/dist/index.js";
+
+// Separate CMP development chats use isolated worktrees. The caller may
+// point to a previously built Core server without modifying that checkout.
+// Preserve the documented sibling checkout default for older workflows.
+const coreModule = process.env.CMP_CORE_SERVER_MODULE
+  ? pathToFileURL(resolve(process.env.CMP_CORE_SERVER_MODULE)).href
+  : new URL("../../cmp-server/dist/server.js",import.meta.url).href;
+const {createCMPServer}=await import(coreModule);
 
 process.env.CMP_ENV="development";
 const token="local-core-test-token-1234567890123456";

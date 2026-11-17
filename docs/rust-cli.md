@@ -117,3 +117,27 @@ The `.cmp` URL is the canonical CMP repository transport identity. The v1 JSON e
 The Core reference server uses `/local/repo.cmp` for its flat, development-only namespace, while CMP Cloud uses `/owner/repo.cmp`. The proprietary Cloud edition requires its matching route to be deployed. A returned 404 before Cloud deployment is not proof the repository is missing.
 
 Non-CMP GitHub commands, including issue, pull request, Codespaces, workflow, release, and GitHub organization management, are not aliases for CMP repository operations and are intentionally not advertised as supported until Cloud services exist.
+
+## M1 diagnostic reliability
+
+`cmp doctor` now returns a nonzero exit code when the selected backend cannot
+authenticate, rejects a required Core capability, reports an invalid repository
+list, cannot access the selected repository, or cannot read its configured
+branch head. Automated setup must check the command's exit code, not only its
+printed output. No user data is written by the remote checks.
+
+For embedded offline mode, `cmp doctor` reads the local repository list and
+configured branch head and reports pending uploads. It does **not** contact
+CMP Cloud while inspecting an offline store. Running `cmp doctor --offline`
+against a Cloud or self-hosted configuration instead **skips remote checks**;
+it does not pretend an embedded local repository exists.
+
+Self-hosted Core's current flat repository ID format differs from the
+`owner/repo` namespace required by `cmp init`. This is a known compatibility
+decision for Master and Protocol, not an implicit permission or routing alias.
+
+The public client Core test runner supports independent engineer worktrees:
+`CMP_CORE_SERVER_MODULE=/absolute/path/to/cmp-server/dist/server.js pnpm verify:local`.
+When unset, it retains its previous sibling-server path. Build the reference
+Core server separately, and do not use production CMP Cloud credentials in this
+test.
