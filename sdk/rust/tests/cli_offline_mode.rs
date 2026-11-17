@@ -460,3 +460,44 @@ fn streaming_refuses_existing_remote_records_without_losing_local_commit() {
     assert!(fx.check(&["stream", "status"]).contains("1"));
     assert_ne!(fx.json(&["head"])["head"], Value::Null);
 }
+
+#[test]
+fn disabling_streaming_preserves_pending_without_enqueuing_new_context_changes() {
+    let fx = Fixture::new();
+    fx.check(&[
+        "setup", "--scope", "project", "--backend", "offline",
+        "--endpoint", "https://offline.invalid", "--repo", "local/knowledge",
+        "--streaming", "--no-interactive",
+    ]);
+    fx.check(&["init", "--repo", "local/knowledge", "--no-interactive"]);
+    // Initial repository creation is queued because streaming was explicitly enabled.
+    let queue = fx.project().join(".cmp/state/stream-outbox.json");
+    let before: Value = serde_json::from_slice(&fs::read(&queue).unwrap()).unwrap();
+    assert_eq!(before["queued"].as_array().unwrap().len(), 1);
+    fx.check(&["config", "set", "streaming", "false"]);
+    assert_eq!(fx.check(&["config", "get", "streaming"]).trim(), "false");
+    let blocked = fx.command(&["stream", "push"]);
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("Streaming is disabled"));
+
+    // Local writes continue to persist, but do not enqueue or attempt upload.
+    let file = fx.project().join("change-while-streaming-disabled.json");
+    fs::write(&file,json!({
+        "message":"Local only context",
+        "changes":[{"op":"put","record":{
+            "id":"fact:offline","kind":"fact","content":"Never uploaded while disabled",
+            "sourceRefs":[],"status":"approved","authorId":"fixture",
+            "updatedAt":"2026-11-16T12:00:00Z"
+        }}]
+    }).to_string()).unwrap();
+    fx.json(&["commit",file.to_str().unwrap()]);
+    let after: Value = serde_json::from_slice(&fs::read(&queue).unwrap()).unwrap();
+    assert_eq!(after["queued"],before["queued"]);
+    assert_eq!(fx.json(&["snapshot"])["records"][0]["id"],"fact:offline");
+
+    // Re-enabling is explicit and cannot silently erase queued history.
+    fx.check(&["config","set","streaming","true"]);
+    let reopened: Value = serde_json::from_slice(&fs::read(&queue).unwrap()).unwrap();
+    assert_eq!(reopened["queued"],before["queued"]);
+    assert_eq!(fx.check(&["config","get","streaming"]).trim(),"true");
+}

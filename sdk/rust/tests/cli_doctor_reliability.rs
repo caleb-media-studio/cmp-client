@@ -58,6 +58,9 @@ fn server(replies:Vec<Reply>)->(String,thread::JoinHandle<Vec<String>>){
                     Err(e)=>panic!("CMP doctor did not issue expected Core request: {e}"),
                 }
             };
+            // macOS may inherit nonblocking mode from the listener on accept.
+            // Ensure the accepted request socket is blocking before timed reads.
+            conn.set_nonblocking(false).unwrap();
             conn.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
             let mut data=Vec::new();
             loop {
